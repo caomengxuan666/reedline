@@ -343,6 +343,7 @@ impl Editor {
             EditCommand::SwapGraphemes => self.line_buffer.swap_graphemes(),
             EditCommand::Undo => self.undo(),
             EditCommand::Redo => self.redo(),
+            EditCommand::RevertLine => status = self.undo_all(),
             EditCommand::CutRightUntil(c) => self.cut_right_until_char(*c, false, true),
             EditCommand::CutRightBefore(c) => self.cut_right_until_char(*c, true, true),
             EditCommand::MoveRightUntil { c, select } => {
@@ -1017,6 +1018,18 @@ impl Editor {
     fn redo(&mut self) {
         let val = self.edit_stack.redo();
         self.line_buffer = val.clone();
+    }
+
+    /// GNU `revert-line` (undo.c:331 `rl_revert_line`): undo every
+    /// change to the current line. Inapplicable (a silent `rl_ding`)
+    /// when the undo stack is empty — nothing reverts.
+    fn undo_all(&mut self) -> EditCommandStatus {
+        if self.edit_stack.undo_all() {
+            self.line_buffer = self.edit_stack.current().clone();
+            EditCommandStatus::Applied
+        } else {
+            EditCommandStatus::Inapplicable
+        }
     }
 
     pub(crate) fn update_undo_state(&mut self, undo_behavior: UndoBehavior) {

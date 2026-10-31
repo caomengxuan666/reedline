@@ -703,6 +703,21 @@ pub enum EditCommand {
     /// Redo an edit command from the undo history
     Redo,
 
+    /// Undo every change to the current line in one step — GNU readline
+    /// `revert-line` (undo.c:331 `rl_revert_line`, bound to `M-r` and
+    /// `M-C-r` in the emacs map). Reports inapplicable when the undo
+    /// stack is empty, matching GNU's `rl_ding` on an empty
+    /// `rl_undo_list`.
+    ///
+    /// Caveat vs GNU: the revert target is the bottom of reedline's
+    /// undo stack — the buffer as it was when this line's editing
+    /// began. GNU instead restores the current history entry's saved
+    /// original (`entry->data`); since reedline's undo coalesces
+    /// history navigation into one entry per hop, a recalled-then-edited
+    /// entry reverts to the live line as it was before traversal, not
+    /// to the entry's text.
+    RevertLine,
+
     /// CutUntil right until char
     CutRightUntil(char),
 
@@ -993,7 +1008,7 @@ impl EditCommand {
             #[cfg(feature = "system_clipboard")] // Sadly cfg attributes in patterns don't work
             EditCommand::CutSelectionSystem | EditCommand::PasteSystem => EditType::EditText,
 
-            EditCommand::Undo | EditCommand::Redo => EditType::UndoRedo,
+            EditCommand::Undo | EditCommand::Redo | EditCommand::RevertLine => EditType::UndoRedo,
 
             EditCommand::CopySelection => EditType::NoOp,
             #[cfg(feature = "system_clipboard")]
