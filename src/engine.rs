@@ -6045,10 +6045,7 @@ mod tests {
         // Toggling off inserts again.
         drive(
             &mut rl,
-            &[
-                KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE),
-                ch('z'),
-            ],
+            &[KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE), ch('z')],
         );
         assert_eq!(rl.editor.get_buffer(), "abxyz");
     }
