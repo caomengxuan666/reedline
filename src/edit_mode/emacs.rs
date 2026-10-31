@@ -46,11 +46,10 @@ pub fn default_emacs_keybindings() -> Keybindings {
     kb.add_binding(KM::CONTROL, KC::Char('g'), edit_bind(EC::Redo));
     kb.add_binding(KM::CONTROL, KC::Char('z'), edit_bind(EC::Undo));
     // Cutting
-    kb.add_binding(
-        KM::CONTROL,
-        KC::Char('y'),
-        edit_bind(EC::PasteCutBufferBefore),
-    );
+    // GNU C-y is `rl_yank` (kill.c:509) — the kill ring's current slot —
+    // and M-y is `rl_yank_pop` (kill.c:527, emacs_keymap.c Meta-y).
+    kb.add_binding(KM::CONTROL, KC::Char('y'), edit_bind(EC::Yank));
+    kb.add_binding(KM::ALT, KC::Char('y'), edit_bind(EC::YankPop));
     kb.add_binding(KM::CONTROL, KC::Char('w'), edit_bind(EC::CutWordLeft));
     kb.add_binding(KM::CONTROL, KC::Char('k'), edit_bind(EC::KillLine));
     kb.add_binding(KM::CONTROL, KC::Char('u'), edit_bind(EC::CutFromStart));

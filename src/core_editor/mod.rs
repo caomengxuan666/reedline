@@ -11,7 +11,7 @@ mod word;
 
 #[cfg(feature = "system_clipboard")]
 pub(crate) use clip_buffer::get_system_clipboard;
-pub(crate) use clip_buffer::{get_local_clipboard, Clipboard};
+pub(crate) use clip_buffer::{Clipboard, LocalClipboard};
 pub(crate) use cursor::{CaretGeometry, Cursor, Movement, SelectionExtent};
 pub(crate) use editor::EditCommandStatus;
 pub use editor::Editor;
