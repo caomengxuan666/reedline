@@ -1493,7 +1493,6 @@ pub enum ReedlineEvent {
         /// `false` for a substring match (GNU `history-substr-search-*`)
         anchored: bool,
     },
-||||||| parent of 5cda717 (feat(macro): keyboard-macro recording — C-x ( C-x ) C-x e)
 
     /// The keypress was absorbed as the first half of a chord the edit
     /// mode is still collecting — the `C-x` of GNU's `C-x )`, which is
