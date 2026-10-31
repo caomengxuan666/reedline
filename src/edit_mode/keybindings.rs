@@ -316,6 +316,16 @@ pub fn add_common_edit_bindings(kb: &mut Keybindings) {
     kb.add_binding(KM::ALT, KC::Enter, edit_bind(EC::InsertNewline));
     kb.add_binding(KM::SHIFT, KC::Enter, edit_bind(EC::InsertNewline));
     kb.add_binding(KM::CONTROL, KC::Char('j'), ReedlineEvent::Enter);
+    // GNU quoted-insert: C-v (and C-q in emacs) read the next key
+    // literally instead of dispatching it.
+    kb.add_binding(KM::CONTROL, KC::Char('v'), ReedlineEvent::QuotedInsert);
+    kb.add_binding(KM::CONTROL, KC::Char('q'), ReedlineEvent::QuotedInsert);
+    // GNU delete-horizontal-space on M-\.
+    kb.add_binding(
+        KM::ALT,
+        KC::Char('\\'),
+        edit_bind(EC::DeleteHorizontalSpace),
+    );
 }
 
 pub fn add_common_selection_bindings(kb: &mut Keybindings) {
