@@ -157,6 +157,19 @@ pub fn default_emacs_keybindings() -> Keybindings {
     kb.add_binding(KM::ALT, KC::Char('l'), edit_bind(EC::LowercaseWord));
     kb.add_binding(KM::ALT, KC::Char('c'), edit_bind(EC::CapitalizeChar));
 
+    // GNU `digit-argument` (misc.c:230): `M-0`..`M-9` accumulate the
+    // numeric argument, `M--` negates it — the emacs_meta_keymap rows
+    // (emacs_keymap.c:366-380). `C-u` stays `unix-line-discard`, which
+    // is GNU's binding for it too (emacs_keymap.c:56).
+    for d in 0..=9u8 {
+        kb.add_binding(
+            KM::ALT,
+            KC::Char(char::from(b'0' + d)),
+            ReedlineEvent::DigitArgument(Some(d)),
+        );
+    }
+    kb.add_binding(KM::ALT, KC::Char('-'), ReedlineEvent::DigitArgument(None));
+
     kb
 }
 
@@ -476,6 +489,23 @@ mod test {
         assert_eq!(
             emacs.parse_event(key('x', KeyModifiers::CONTROL)),
             ReedlineEvent::ClearScreen
+        );
+    }
+
+    /// `M-0`..`M-9` parse to `DigitArgument`, `M--` to the sign —
+    /// emacs_meta_keymap's digit-argument rows (emacs_keymap.c:366-380).
+    #[test]
+    fn alt_digits_parse_to_digit_argument() {
+        let mut emacs = Emacs::default();
+        for (c, d) in ('0'..='9').zip(0..=9) {
+            assert_eq!(
+                emacs.parse_event(key(c, KeyModifiers::ALT)),
+                ReedlineEvent::DigitArgument(Some(d))
+            );
+        }
+        assert_eq!(
+            emacs.parse_event(key('-', KeyModifiers::ALT)),
+            ReedlineEvent::DigitArgument(None)
         );
     }
 

@@ -1534,6 +1534,41 @@ pub enum ReedlineEvent {
     /// replayed keys queue ahead of live input exactly like
     /// [`KeySequence`](ReedlineEvent::KeySequence).
     CallLastKbdMacro,
+
+    /// Accumulate a digit into the pending numeric argument (GNU
+    /// `rl_digit_argument`, `misc.c:230`): `Some(d)` is an `M-0`..`M-9`
+    /// key, `None` is `M--`, which negates the argument. Fully applied
+    /// at parse time — the argument is engine state and a real key
+    /// never reaches a handler; GNU reads the rest of the argument
+    /// inside `rl_digit_loop` (`misc.c:192`) instead.
+    DigitArgument(Option<u8>),
+
+    /// Multiply the pending numeric argument by four (GNU
+    /// `rl_universal_argument`, `misc.c:262`). Unbound in the default
+    /// emacs map — GNU binds `C-u` to `unix-line-discard` there
+    /// (`emacs_keymap.c:56`), which stays ours. Applied at parse time
+    /// like [`DigitArgument`](ReedlineEvent::DigitArgument).
+    UniversalArgument,
+
+    /// The key that terminated numeric-argument accumulation,
+    /// dispatched under the argument (GNU `misc.c`
+    /// `_rl_arg_dispatch:174`: every non-argument key ends the loop and
+    /// is itself dispatched with `count = rl_numeric_arg *
+    /// rl_arg_sign`).
+    ///
+    /// `explicit` mirrors `rl_explicit_arg` — set once a digit was
+    /// seen, or `M--` was upgraded to `-1` by GNU's `NUM_SAWMINUS`
+    /// rule (`misc.c:170`). Nothing consumes it yet; it is carried so
+    /// count-aware commands (GNU's yank-last-arg, overwrite-mode) can
+    /// later tell "no argument" from "the argument was 1".
+    WithArg {
+        /// `rl_numeric_arg * rl_arg_sign` (`readline.c:941`)
+        count: i32,
+        /// `rl_explicit_arg`
+        explicit: bool,
+        /// The terminating key's own event.
+        event: Box<ReedlineEvent>,
+    },
 }
 
 pub enum EventStatus {

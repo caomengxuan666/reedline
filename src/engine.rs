@@ -345,6 +345,11 @@ pub struct Reedline {
     // search.c:701,737,755).
     history_line_search: Option<HistoryLineSearch>,
 
+    // Copies of the quoted character a pending numeric argument asked
+    // for when `QuotedInsert` was dispatched — GNU passes its count to
+    // `_rl_insert_char` (text.c:1056). 1 without an argument.
+    quoted_insert_count: usize,
+
     // Keyboard-macro recording (GNU `RL_STATE_MACRODEF` +
     // `current_macro`, macro.c): `Some` once
     // `ReedlineEvent::StartKbdMacro` has armed it — every key press is
@@ -357,6 +362,13 @@ pub struct Reedline {
     // `current_macro` after `rl_end_kbd_macro`, macro.c:270);
     // `CallLastKbdMacro` replays it through `enqueue_replayed_keys`.
     last_macro: Vec<crate::KeyCombination>,
+
+    // Numeric argument accumulating (GNU `RL_STATE_NUMERICARG`,
+    // misc.c): set by `ReedlineEvent::DigitArgument` /
+    // `UniversalArgument` at parse time, spent by the next key that is
+    // neither — GNU reads the argument inside `rl_digit_loop` and
+    // dispatches the terminating key with the count (misc.c:174).
+    pending_arg: Option<PendingArg>,
 
     // Nesting depth of the event currently being handled — set from the
     // pending_input tag for replayed keys, 0 for live input. A
@@ -381,6 +393,53 @@ pub struct Reedline {
     // Callback function that is called periodically while waiting for input.
     // Useful for processing external events (e.g., GUI updates) during idle time.
     idle_callback: Option<Box<dyn FnMut() + Send>>,
+}
+
+/// A numeric argument mid-accumulation — GNU `misc.c` `rl_numeric_arg`,
+/// `rl_arg_sign`, `rl_explicit_arg` and the `_rl_argcxt` bits the state
+/// machine uses.
+#[derive(Debug, Clone, Copy)]
+struct PendingArg {
+    /// `rl_numeric_arg` — magnitude only; the sign lives in `sign`.
+    value: i64,
+    /// `rl_arg_sign`: -1 once `M--` has negated the argument.
+    sign: i64,
+    /// `rl_explicit_arg`: a digit was seen. Stays unset through
+    /// `universal-argument` keys, which is why `C-u 5` is 5, not 20
+    /// (`misc.c:152`).
+    explicit: bool,
+    /// `_rl_argcxt & NUM_SAWDIGITS`: a `universal-argument` key after
+    /// digits ends the argument instead of multiplying (`misc.c:121`).
+    saw_digits: bool,
+    /// GNU's `C-u`-after-digits branch (`misc.c:121-133`): the
+    /// `universal-argument` key is ignored and the NEXT key dispatches
+    /// under the count no matter what it parses to — even a digit,
+    /// which then seeds a fresh argument.
+    dispatch_next: bool,
+}
+
+impl PendingArg {
+    fn fresh() -> Self {
+        PendingArg {
+            value: 1,
+            sign: 1,
+            explicit: false,
+            saw_digits: false,
+            dispatch_next: false,
+        }
+    }
+
+    /// `rl_numeric_arg * rl_arg_sign` — the count a dispatched function
+    /// receives (`readline.c:941`).
+    fn count(&self) -> i64 {
+        self.value * self.sign
+    }
+
+    /// `rl_explicit_arg`, including GNU's `M--`-is-`-1` upgrade
+    /// (`misc.c:170`): a bare negative sign means an explicit `-1`.
+    fn explicit(&self) -> bool {
+        self.explicit || self.sign < 0
+    }
 }
 
 struct BufferEditor {
@@ -691,8 +750,10 @@ impl Reedline {
             immediately_accept: false,
             pending_input: VecDeque::new(),
             event_replay_depths: VecDeque::new(),
+            quoted_insert_count: 1,
             recording: None,
             last_macro: Vec::new(),
+            pending_arg: None,
             quoted_insert: false,
             edit_dispatched: false,
             pending_char_search: None,
@@ -1765,6 +1826,67 @@ impl Reedline {
         );
     }
 
+    /// GNU `misc.c` `_rl_arg_overflow` (misc.c:80): an argument that
+    /// grows past a million dings and discards the accumulation.
+    const MAX_NUMERIC_ARG: i64 = 1_000_000;
+
+    /// Feed a `DigitArgument` key into the accumulation — `Some(d)` an
+    /// `M-0`..`M-9` digit, `None` the `M--` sign. Mirrors
+    /// `_rl_arg_dispatch` (misc.c:116-183); a fresh argument when none
+    /// was pending is `rl_digit_argument` seeding the loop with its
+    /// own key (misc.c:230).
+    fn arg_digit(&mut self, digit: Option<u8>) {
+        let mut arg = self.pending_arg.unwrap_or_else(PendingArg::fresh);
+        match digit {
+            Some(d) => {
+                // misc.c:152 — a digit replaces the pending value
+                // unless earlier digits already made it explicit
+                // (`rl_explicit_arg` stays unset through `C-u`s, so
+                // `C-u 5` is 5, not 20).
+                arg.value = if arg.explicit {
+                    arg.value.saturating_mul(10).saturating_add(i64::from(d))
+                } else {
+                    i64::from(d)
+                };
+                arg.explicit = true;
+                arg.saw_digits = true;
+            }
+            None => {
+                // misc.c:159 — `M--` negates: GNU sets `rl_arg_sign`
+                // while `rl_explicit_arg` is unset, and after digits
+                // re-dispatches the `M--` binding itself (misc.c:174).
+                // Toggling the sign of the accumulation is the closest
+                // read of that re-dispatch that stays finite.
+                arg.sign = -arg.sign;
+            }
+        }
+        self.pending_arg = (arg.value <= Self::MAX_NUMERIC_ARG).then_some(arg);
+    }
+
+    /// `rl_universal_argument` (misc.c:262): multiply by four while no
+    /// digits are down; after digits GNU ignores the key entirely and
+    /// dispatches the NEXT one under the count (misc.c:121-133), which
+    /// `dispatch_next` arms.
+    fn arg_universal(&mut self) {
+        let mut arg = self.pending_arg.unwrap_or_else(PendingArg::fresh);
+        if arg.saw_digits {
+            arg.dispatch_next = true;
+        } else {
+            arg.value = arg.value.saturating_mul(4);
+        }
+        self.pending_arg = (arg.value <= Self::MAX_NUMERIC_ARG).then_some(arg);
+    }
+
+    /// Wrap the terminating key's event with the spent argument — the
+    /// `_rl_arg_dispatch` else-branch (misc.c:174-182).
+    fn with_arg(arg: PendingArg, event: ReedlineEvent) -> ReedlineEvent {
+        ReedlineEvent::WithArg {
+            count: i32::try_from(arg.count()).unwrap_or(i32::MAX),
+            explicit: arg.explicit(),
+            event: Box::new(event),
+        }
+    }
+
     /// `rl_start_kbd_macro` (macro.c:246): arm the recorder. An
     /// explicit argument is GNU's append mode (macro.c:253-258): the
     /// previous macro is replayed first and keeps recording, so the
@@ -1961,10 +2083,15 @@ impl Reedline {
                 // Quoted-insert bypasses the keymap: the armed flag turns
                 // the next key press into its literal character (GNU
                 // rl_quoted_insert). Anything else is consumed and gone.
+                // A numeric argument repeats the insert — GNU passes the
+                // count to `_rl_insert_char` (text.c:1056).
                 if self.quoted_insert {
                     self.quoted_insert = false;
+                    let count = std::mem::replace(&mut self.quoted_insert_count, 1);
                     if let Some(c) = quoted_insert_char(&event) {
-                        edits.push(EditCommand::InsertChar(c));
+                        for _ in 0..count {
+                            edits.push(EditCommand::InsertChar(c));
+                        }
                     }
                     continue;
                 }
@@ -2004,10 +2131,32 @@ impl Reedline {
                                 recording.pop();
                             }
                         }
+                        // Numeric-argument keys accumulate in place and
+                        // never reach the queue — GNU reads them inside
+                        // `rl_digit_loop` (misc.c:192). `dispatch_next`
+                        // is GNU's `C-u`-after-digits branch (misc.c:121):
+                        // it makes even a digit terminate.
+                        ReedlineEvent::DigitArgument(digit)
+                            if !self.pending_arg.is_some_and(|arg| arg.dispatch_next) =>
+                        {
+                            self.arg_digit(digit);
+                        }
+                        ReedlineEvent::UniversalArgument
+                            if !self.pending_arg.is_some_and(|arg| arg.dispatch_next) =>
+                        {
+                            self.arg_universal();
+                        }
                         // Macro controls are engine state, applied at
-                        // parse time like QuotedInsert below.
+                        // parse time like QuotedInsert below — and ahead
+                        // of the argument wrap, since GNU dispatches
+                        // them WITH the count: `rl_start_kbd_macro`
+                        // reads `rl_explicit_arg` (macro.c:253) and
+                        // `rl_end_kbd_macro` runs the new macro
+                        // `count - 1` times (macro.c:283).
                         ReedlineEvent::StartKbdMacro => {
-                            self.start_kbd_macro(false);
+                            let explicit =
+                                self.pending_arg.take().is_some_and(|arg| arg.explicit());
+                            self.start_kbd_macro(explicit);
                         }
                         ReedlineEvent::EndKbdMacro => {
                             // The keys that invoked end are not part of
@@ -2018,7 +2167,10 @@ impl Reedline {
                             if let Some(recording) = self.recording.as_mut() {
                                 recording.pop();
                             }
-                            self.end_kbd_macro();
+                            let count = self.pending_arg.take().map_or(0, |arg| arg.count());
+                            if self.end_kbd_macro() && count > 0 {
+                                self.call_last_kbd_macro(count - 1);
+                            }
                         }
                         ReedlineEvent::CallLastKbdMacro => {
                             if self.recording.is_some() {
@@ -2028,57 +2180,41 @@ impl Reedline {
                                 if let Some(recording) = self.recording.as_mut() {
                                     recording.pop();
                                 }
+                                self.pending_arg = None;
                             } else {
-                                self.call_last_kbd_macro(1);
+                                let count = self.pending_arg.take().map_or(1, |arg| arg.count());
+                                self.call_last_kbd_macro(count);
                             }
                         }
-                        // A chord's prefix half produced no event — the
-                        // `C-x` of `C-x )`. It is not part of a macro
-                        // recording either: GNU strips the resolved
-                        // sequence's keys at `rl_end_kbd_macro`
-                        // (macro.c:276); erasing the prefix as it arrives
-                        // nets out the same and keeps aborted chords out.
-                        ReedlineEvent::Pending => {
-                            if let Some(recording) = self.recording.as_mut() {
-                                recording.pop();
-                            }
-                        }
-                        // Macro controls are engine state, applied at
-                        // parse time like QuotedInsert below.
-                        ReedlineEvent::StartKbdMacro => {
-                            self.start_kbd_macro(false);
-                        }
-                        ReedlineEvent::EndKbdMacro => {
-                            // The keys that invoked end are not part of
-                            // the recording — GNU subtracts
-                            // `rl_key_sequence_length` (macro.c:276);
-                            // the `C-x` half was already erased by
-                            // `Pending` above.
-                            if let Some(recording) = self.recording.as_mut() {
-                                recording.pop();
-                            }
-                            self.end_kbd_macro();
-                        }
-                        ReedlineEvent::CallLastKbdMacro => {
-                            if self.recording.is_some() {
-                                // "no recursive macros" (macro.c:296):
-                                // refused, and the invoking key is
-                                // erased from the recording.
-                                if let Some(recording) = self.recording.as_mut() {
-                                    recording.pop();
+                        ReedlineEvent::Edit(edit) => {
+                            match self.pending_arg.take() {
+                                // The terminating key dispatches under
+                                // the count (misc.c:174): flush what
+                                // accumulated before it, then queue the
+                                // wrapped edit.
+                                Some(arg) => {
+                                    if !edits.is_empty() {
+                                        reedline_events.push((
+                                            ReedlineEvent::Edit(std::mem::take(&mut edits)),
+                                            self.replay_depth,
+                                        ));
+                                    }
+                                    reedline_events.push((
+                                        Self::with_arg(arg, ReedlineEvent::Edit(edit)),
+                                        self.replay_depth,
+                                    ));
                                 }
-                            } else {
-                                self.call_last_kbd_macro(1);
+                                None => edits.extend(edit),
                             }
                         }
-                        ReedlineEvent::Edit(edit) => edits.extend(edit),
                         ReedlineEvent::Resize(x, y) => resize = Some((x, y)),
                         // Quoted-insert is fully applied at parse
                         // time: fast typists deliver the trigger and
                         // the next key in one batch, and the next
                         // event is consumed right below. Pushing the
                         // event would let its handler re-arm a flag
-                        // the batch already spent.
+                        // the batch already spent. GNU passes its
+                        // count to `_rl_insert_char` (text.c:1056).
                         ReedlineEvent::QuotedInsert => {
                             if !edits.is_empty() {
                                 reedline_events.push((
@@ -2086,7 +2222,9 @@ impl Reedline {
                                     self.replay_depth,
                                 ));
                             }
+                            let count = self.pending_arg.take().map_or(1, |arg| arg.count());
                             self.quoted_insert = true;
+                            self.quoted_insert_count = usize::try_from(count).unwrap_or(0);
                         }
                         event => {
                             if !edits.is_empty() {
@@ -2095,6 +2233,12 @@ impl Reedline {
                                     self.replay_depth,
                                 ));
                             }
+                            // A pending argument spends itself on any
+                            // other key (misc.c:174).
+                            let event = match self.pending_arg.take() {
+                                Some(arg) => Self::with_arg(arg, event),
+                                None => event,
+                            };
                             if let ReedlineEvent::CharSearch { direction } = event {
                                 self.pending_char_search = Some(direction);
                             } else if let ReedlineEvent::KeySequence(keys) = event {
@@ -2189,11 +2333,41 @@ impl Reedline {
             self.enqueue_replayed_keys(keys, self.replay_depth + 1);
             return Ok(EventStatus::Handled);
         }
+        // The terminating key of a numeric argument is dispatched under
+        // the count (GNU `_rl_arg_dispatch`, misc.c:174). Our events take
+        // no count, so repetition stands in for it: the event runs
+        // |count| times, stopping at the first non-`Handled` status — a
+        // submit still exits once, an `UntilFound` miss is not retried.
+        // GNU hands functions the SIGNED count; direction-aware commands
+        // (negative self-insert deleting backward, misc.c consumers
+        // reading `rl_explicit_arg`) are not expressed yet — the signed
+        // `count` and `explicit` ride along for them.
+        if let ReedlineEvent::WithArg { count, event, .. } = event {
+            if count == 0 {
+                // An explicit `M-0` dispatches with count 0.
+                return Ok(EventStatus::Handled);
+            }
+            // Argument keys dispatched under a count run once (GNU's
+            // `rl_digit_argument` ignores its count, misc.c:230) — a
+            // `C-u`-terminated argument can seed the next one.
+            let reps = match *event {
+                ReedlineEvent::DigitArgument(_) | ReedlineEvent::UniversalArgument => 1,
+                _ => count.unsigned_abs(),
+            };
+            let mut status = EventStatus::Handled;
+            for _ in 0..reps {
+                status = self.handle_event(prompt, (*event).clone())?;
+                if !matches!(status, EventStatus::Handled) {
+                    break;
+                }
+            }
+            return Ok(status);
+        }
         self.edit_dispatched = false;
-        // Macro controls are engine state — a real key press reaches
-        // here only through a `Multiple` or a programmatic push, so
-        // they apply without the parse-time keystroke bookkeeping
-        // (the recording pops).
+        // Macro controls and argument keys are engine state — a real
+        // key press reaches here only through a `Multiple`, a `WithArg`
+        // dispatch, or a programmatic push, so they apply without the
+        // parse-time keystroke bookkeeping (recording pops, arg spend).
         match event {
             ReedlineEvent::StartKbdMacro => {
                 self.start_kbd_macro(false);
@@ -2211,6 +2385,14 @@ impl Reedline {
                     return Ok(EventStatus::Inapplicable);
                 }
                 self.call_last_kbd_macro(1);
+                return Ok(EventStatus::Handled);
+            }
+            ReedlineEvent::DigitArgument(digit) => {
+                self.arg_digit(digit);
+                return Ok(EventStatus::Handled);
+            }
+            ReedlineEvent::UniversalArgument => {
+                self.arg_universal();
                 return Ok(EventStatus::Handled);
             }
             _ => {}
@@ -2358,6 +2540,9 @@ impl Reedline {
             | ReedlineEvent::StartKbdMacro
             | ReedlineEvent::EndKbdMacro
             | ReedlineEvent::CallLastKbdMacro
+            | ReedlineEvent::DigitArgument(_)
+            | ReedlineEvent::UniversalArgument
+            | ReedlineEvent::WithArg { .. }
             | ReedlineEvent::Multiple(_)
             | ReedlineEvent::None
             | ReedlineEvent::HistoryHintWordComplete
@@ -2865,7 +3050,10 @@ impl Reedline {
             | ReedlineEvent::Pending
             | ReedlineEvent::StartKbdMacro
             | ReedlineEvent::EndKbdMacro
-            | ReedlineEvent::CallLastKbdMacro => Ok(EventStatus::Inapplicable),
+            | ReedlineEvent::CallLastKbdMacro
+            | ReedlineEvent::DigitArgument(_)
+            | ReedlineEvent::UniversalArgument
+            | ReedlineEvent::WithArg { .. } => Ok(EventStatus::Inapplicable),
         }
     }
 
@@ -5713,6 +5901,121 @@ mod tests {
         drive(&mut rl, &[ctrl('x'), ch('e'), ch('a')]);
         assert!(rl.pending_input.is_empty());
         assert_eq!(rl.editor.get_buffer(), "a");
+    }
+
+    /// `M-3 a` — the count reaches the terminating key's self-insert
+    /// (misc.c:174 + `_rl_insert_char`).
+    #[test]
+    fn digit_argument_repeats_self_insert() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        drive(&mut rl, &[alt('3'), ch('a')]);
+        assert_eq!(rl.editor.get_buffer(), "aaa");
+    }
+
+    /// `M-1 M-2 a` — digits accumulate by tens (misc.c:152).
+    #[test]
+    fn digit_argument_accumulates() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        drive(&mut rl, &[alt('1'), alt('2'), ch('a')]);
+        assert_eq!(rl.editor.get_buffer(), "a".repeat(12));
+    }
+
+    /// ANY other key terminates the accumulation and is dispatched
+    /// under the count — a bound command repeats the same way.
+    #[test]
+    fn digit_argument_repeats_bound_commands() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        drive(&mut rl, &[ch('x'), ch('y'), ch('z')]);
+        drive(&mut rl, &[alt('2'), ctrl('b')]);
+        assert_eq!(rl.current_insertion_point(), 1);
+        // The arg is spent: the next key inserts once.
+        drive(&mut rl, &[ch('a')]);
+        assert_eq!(rl.editor.get_buffer(), "xayz");
+    }
+
+    /// `M--` negates (misc.c:159): `rl_arg_sign` reaches the
+    /// terminating key's count (readline.c:941).
+    #[test]
+    fn digit_argument_minus_negates() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        drive(&mut rl, &[alt('-'), alt('3')]);
+        assert_eq!(rl.pending_arg.unwrap().count(), -3);
+        drive(&mut rl, &[ch('a')]);
+        // GNU hands the function the signed count; our repetition
+        // consumes the magnitude — direction-aware commands are not
+        // expressed yet.
+        assert_eq!(rl.editor.get_buffer(), "aaa");
+        assert!(rl.pending_arg.is_none());
+    }
+
+    /// `M--` alone is `M--1` — GNU's NUM_SAWMINUS upgrade (misc.c:170).
+    #[test]
+    fn digit_argument_bare_minus_is_minus_one() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        drive(&mut rl, &[alt('-'), ch('x')]);
+        assert_eq!(rl.editor.get_buffer(), "x");
+    }
+
+    /// `rl_universal_argument` multiplies by four (misc.c:262). GNU
+    /// binds `C-u` to unix-line-discard in the emacs map, so the test
+    /// wires the event to a spare key.
+    #[test]
+    fn universal_argument_multiplies_by_four() {
+        let mut rl = seam_engine(emacs_with(
+            KeyModifiers::ALT,
+            KeyCode::Char('u'),
+            ReedlineEvent::UniversalArgument,
+        ));
+        let cu = alt('u');
+        drive(&mut rl, &[cu, ch('a')]);
+        assert_eq!(rl.editor.get_buffer(), "aaaa");
+        drive(&mut rl, &[cu, cu, ch('b')]);
+        assert_eq!(rl.editor.get_buffer(), format!("aaaa{}", "b".repeat(16)));
+        // A digit after universal-argument replaces it — GNU keeps
+        // rl_explicit_arg unset through `C-u`s (misc.c:152), so
+        // `C-u 3` is 3, not 12.
+        drive(&mut rl, &[cu, alt('3'), ch('c')]);
+        assert_eq!(rl.editor.get_buffer(), format!("aaaa{}ccc", "b".repeat(16)));
+    }
+
+    /// The argument survives the `C-x` chord prefix and repeats the
+    /// macro call — `M-3 C-x e` runs the recording three times.
+    #[test]
+    fn digit_argument_repeats_macro_call() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        let cx = ctrl('x');
+        drive(&mut rl, &[cx, ch('('), ch('x'), cx, ch(')')]);
+        drive(&mut rl, &[alt('3'), cx, ch('e')]);
+        assert_eq!(rl.pending_input.len(), 3);
+        drive(&mut rl, &[]);
+        assert_eq!(rl.editor.get_buffer(), "xxxx");
+    }
+
+    /// A count on `C-x )` runs the new macro `count - 1` more times —
+    /// the definition counted as the first (macro.c:283). The count
+    /// keys are recorded like everything else, so the replayed tail
+    /// leaves an argument armed the way GNU's does.
+    #[test]
+    fn digit_argument_on_macro_end_executes_count_minus_one() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        let cx = ctrl('x');
+        // Record [z, M-2] and end with arg 2: replay once more.
+        drive(&mut rl, &[cx, ch('('), ch('z'), alt('2'), cx, ch(')')]);
+        assert_eq!(rl.editor.get_buffer(), "z");
+        assert_eq!(rl.pending_input.len(), 2);
+        drive(&mut rl, &[]);
+        // Replay: z inserts, M-2 arms arg 2 for the next live key.
+        assert_eq!(rl.editor.get_buffer(), "zz");
+        drive(&mut rl, &[ch('a')]);
+        assert_eq!(rl.editor.get_buffer(), "zzaa");
+    }
+
+    /// `M-0` terminates with count 0 — nothing runs.
+    #[test]
+    fn digit_argument_zero_runs_nothing() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        drive(&mut rl, &[alt('0'), ch('a')]);
+        assert_eq!(rl.editor.get_buffer(), "");
     }
 
     #[test]
