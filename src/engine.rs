@@ -2,12 +2,9 @@ use std::{collections::HashMap, ffi::OsStr, mem, ops::ControlFlow, path::PathBuf
 
 use nu_ansi_term::{Color, Style};
 
-use crate::{enums::ReedlineRawEvent, external_printer::ExternalOutput, CursorConfig};
 #[cfg(feature = "bashisms")]
-use crate::{
-    history::SearchFilter,
-    menu_functions::{parse_selection_char, ParseAction},
-};
+use crate::menu_functions::{parse_selection_char, ParseAction};
+use crate::{enums::ReedlineRawEvent, external_printer::ExternalOutput, CursorConfig};
 use {
     crate::{
         completion::{Completer, CompletionOrigin, CompletionStatus, DefaultCompleter},
@@ -18,7 +15,7 @@ use {
         hinter::Hinter,
         history::{
             FileBackedHistory, History, HistoryCursor, HistoryItem, HistoryItemId,
-            HistoryNavigationQuery, HistorySessionId, SearchDirection, SearchQuery,
+            HistoryNavigationQuery, HistorySessionId, SearchDirection, SearchFilter, SearchQuery,
         },
         painting::{
             escape_control, escape_control_keep_sgr, Painter, PainterSuspendedState, PromptLines,
@@ -33,9 +30,10 @@ use {
             tty_mode::TtyModeGuard,
         },
         utils::text_manipulation,
-        AbbrExpandContext, AutoPairAction, AutoPairContext, AutoPairs, EditCommand,
-        ExampleHighlighter, Highlighter, LineBuffer, Menu, MenuEvent, MouseButton, Prompt,
-        PromptHistorySearch, ReedlineMenu, Signal, UndoBehavior, ValidationResult, Validator,
+        AbbrExpandContext, AutoPairAction, AutoPairContext, AutoPairs, Direction, EditCommand,
+        ExampleHighlighter, FindStop, Highlighter, LineBuffer, Menu, MenuEvent, MotionTarget,
+        MouseButton, Prompt, PromptHistorySearch, ReedlineMenu, Signal, UndoBehavior,
+        ValidationResult, Validator,
     },
     crossterm::{
         cursor::SetCursorStyle,
@@ -135,6 +133,43 @@ impl HistoryLastRun {
     fn is_recalled(&self) -> bool {
         matches!(self, Self::Excluded { recalled: true, .. })
     }
+}
+
+/// `rl_yank_last_arg`'s repeat state (kill.c:653-672 — the function's
+/// `static` locals, made per-engine): a consecutive `M-.` undoes the
+/// previous insert and yanks the same argument from a progressively
+/// older entry; a negative numeric arg flips the walk direction.
+struct YankLastArgState {
+    /// How many entries before the current history position to reach
+    /// back — 0 is the immediately previous entry (GNU `history_skip`).
+    history_skip: i64,
+    /// Whether the first press carried an explicit argument
+    /// (GNU `explicit_arg_p`): then `count` is the argument index,
+    /// otherwise `'$'` (last) is yanked.
+    explicit_arg: bool,
+    /// The argument index the first press passed (GNU `count_passed`).
+    count: i32,
+    /// +1 walks older, -1 walks newer (GNU `direction`, flipped by a
+    /// negative count on a repeat).
+    direction: i64,
+    /// Whether the previous press inserted — then a repeat first undoes
+    /// it (GNU `undo_needed` → `rl_do_undo`).
+    undo_needed: bool,
+}
+
+/// `rl_history_search_*`'s reinit data (search.c:648
+/// `rl_history_search_reinit` — `_rl_history_search_pos`,
+/// `_rl_history_search_len`, `_rl_history_search_flags`): kept while
+/// consecutive `ReedlineEvent::HistorySearch` events of the same
+/// `anchored` family continue the search.
+struct HistoryLineSearch {
+    /// Which GNU family is live — `true` for `history-search-*`
+    /// (anchored prefix), `false` for `history-substr-search-*`.
+    anchored: bool,
+    /// The insertion point at reinit (GNU `_rl_history_search_len`):
+    /// the needle is `buffer[..point]` then, an anchored match lands
+    /// the point back on it, and a failed search restores it.
+    search_len: usize,
 }
 
 /// Line editor engine
@@ -281,6 +316,34 @@ pub struct Reedline {
     // a handled event that ran no edit still clears the editor's
     // `_rl_last_command_was_kill`/`rl_last_func` records (readline.c:715-716).
     edit_dispatched: bool,
+
+    // `ReedlineEvent::CharSearch` armed: the next `Char` key press is
+    // consumed as the character to find instead of dispatching through
+    // the keymap (GNU text.c _rl_char_search — one input char is the
+    // search target; a non-Char key cancels).
+    pending_char_search: Option<Direction>,
+
+    // `rl_last_func == rl_yank_last_arg` tracking: the state a
+    // consecutive `ReedlineEvent::YankLastArg` resumes — cleared by any
+    // other event (and at each `read_line` start).
+    yank_last_arg: Option<YankLastArgState>,
+
+    // The history entry the line was last recalled to, this `read_line`
+    // — reedline's `where_history()` for `OperateAndGetNext` and
+    // `YankLastArg`. `None` is the live line (fresh or walked back to).
+    history_recall_pos: Option<HistoryItemId>,
+
+    // `ReedlineEvent::OperateAndGetNext`'s cross-`read_line` intent
+    // (GNU `saved_history_logical_offset`, misc.c:770-789): `Some(id)`
+    // preloads the entry after `id`; `None` inside means the line was
+    // fresh and nothing is preloaded.
+    operate_and_get_next: Option<Option<HistoryItemId>>,
+
+    // Live `rl_history_search_*`/`rl_history_substr_search_*` state —
+    // present only while consecutive `ReedlineEvent::HistorySearch`
+    // events continue one search (GNU's `rl_last_func` reinit checks,
+    // search.c:701,737,755).
+    history_line_search: Option<HistoryLineSearch>,
 
     // Nesting depth of the event currently being handled — set from the
     // pending_input tag for replayed keys, 0 for live input. A
@@ -617,6 +680,11 @@ impl Reedline {
             event_replay_depths: VecDeque::new(),
             quoted_insert: false,
             edit_dispatched: false,
+            pending_char_search: None,
+            yank_last_arg: None,
+            history_recall_pos: None,
+            operate_and_get_next: None,
+            history_line_search: None,
             replay_depth: 0,
             break_signal: None,
             repaint_signal: None,
@@ -1369,6 +1437,13 @@ impl Reedline {
         // the fresh prompt painted below already reflects the latest state.
         self.take_repaint_request();
 
+        // Per-line GNU command tracking resets: a new line sits at the
+        // live (unsaved) history position — `where_history()` is fresh —
+        // and no previous command exists for `rl_last_func` chains.
+        self.history_recall_pos = None;
+        self.yank_last_arg = None;
+        self.history_line_search = None;
+
         self.suspended_state.take()
     }
 
@@ -1376,6 +1451,10 @@ impl Reedline {
     /// in a `raw_mode` context.
     fn read_line_helper(&mut self, prompt: &dyn Prompt) -> Result<Signal> {
         let suspended_state = self.begin_read();
+        // A `C-o` from the previous line preloads the entry after its
+        // history position before the first paint (GNU
+        // `_rl_internal_startup_hook` → `set_saved_history`, misc.c).
+        self.apply_operate_and_get_next();
         self.painter
             .initialize_prompt_position(suspended_state.as_ref())?;
         self.repaint(prompt)?;
@@ -1787,6 +1866,29 @@ impl Reedline {
                     }
                     continue;
                 }
+                // Char-search consumes one key the same way
+                // quoted-insert does (GNU text.c _rl_char_search —
+                // `_rl_bracketed_read_key` reads exactly one input
+                // character): a `Char` press becomes a `Find` move that
+                // lands ON the match (FFIND/BFIND); any other key
+                // cancels the search.
+                if let Some(direction) = self.pending_char_search.take() {
+                    if let Event::Key(KeyEvent {
+                        code: KeyCode::Char(c),
+                        kind,
+                        ..
+                    }) = event
+                    {
+                        if kind != KeyEventKind::Release {
+                            edits.push(EditCommand::Move(MotionTarget::Find {
+                                ch: c,
+                                direction,
+                                stop: FindStop::On,
+                            }));
+                        }
+                    }
+                    continue;
+                }
                 if let Ok(event) = ReedlineRawEvent::try_from(event) {
                     match self.edit_mode.parse_event(event) {
                         ReedlineEvent::Edit(edit) => edits.extend(edit),
@@ -1806,6 +1908,8 @@ impl Reedline {
                             // the batch already spent.
                             if matches!(event, ReedlineEvent::QuotedInsert) {
                                 self.quoted_insert = true;
+                            } else if let ReedlineEvent::CharSearch { direction } = event {
+                                self.pending_char_search = Some(direction);
                             } else if let ReedlineEvent::KeySequence(keys) = event {
                                 // Applied at parse time where the source's
                                 // nesting depth is known; a replayed macro
@@ -1965,6 +2069,10 @@ impl Reedline {
                     self.editor
                         .set_buffer(string, UndoBehavior::CreateUndoPoint);
                 }
+                // Accepting an isearch match leaves the history position
+                // on the found entry (GNU's isearch lands `where_history`
+                // there too), which `OperateAndGetNext`/`YankLastArg` read.
+                self.history_recall_pos = self.history_cursor.id_at_cursor();
 
                 self.input_mode = InputMode::Regular;
                 Ok(EventStatus::Handled)
@@ -2029,6 +2137,11 @@ impl Reedline {
             | ReedlineEvent::ToEnd
             | ReedlineEvent::KeySequence(_)
             | ReedlineEvent::QuotedInsert
+            | ReedlineEvent::CharSearch { .. }
+            | ReedlineEvent::YankLastArg { .. }
+            | ReedlineEvent::YankNthArg { .. }
+            | ReedlineEvent::OperateAndGetNext
+            | ReedlineEvent::HistorySearch { .. }
             | ReedlineEvent::Multiple(_)
             | ReedlineEvent::None
             | ReedlineEvent::HistoryHintWordComplete
@@ -2052,6 +2165,19 @@ impl Reedline {
         prompt: &dyn Prompt,
         event: ReedlineEvent,
     ) -> io::Result<EventStatus> {
+        // GNU's `rl_last_func` chains: `rl_yank_last_arg`'s repeat-walk
+        // (kill.c:654) and `rl_history_search_*`'s reinit guards
+        // (search.c:701,737,755) both resume only while the previous
+        // command was the same one — anything else resets the state.
+        // Nested `Multiple`/`UntilFound` events pass through here
+        // individually, which matches GNU treating each command as the
+        // last func.
+        if !matches!(event, ReedlineEvent::YankLastArg { .. }) {
+            self.yank_last_arg = None;
+        }
+        if !matches!(event, ReedlineEvent::HistorySearch { .. }) {
+            self.history_line_search = None;
+        }
         match event {
             ReedlineEvent::Menu(name) => {
                 if self.active_menu().is_none() {
@@ -2199,6 +2325,27 @@ impl Reedline {
                 self.quoted_insert = true;
                 Ok(EventStatus::Handled)
             }
+            ReedlineEvent::CharSearch { direction } => {
+                // Reached when the event is dispatched outside an input
+                // batch (e.g. from a `Multiple` handled event-side);
+                // the batch parse path arms this flag directly.
+                self.pending_char_search = Some(direction);
+                Ok(EventStatus::Handled)
+            }
+            ReedlineEvent::YankLastArg { count } => self.yank_last_arg(count),
+            ReedlineEvent::YankNthArg { count } => self.yank_nth_arg(count),
+            ReedlineEvent::OperateAndGetNext => {
+                // Record the entry *after* the current history position
+                // for the next `read_line` to preload (GNU
+                // `saved_history_logical_offset`, misc.c:786), then run
+                // the line like `Submit` (GNU `rl_newline` first).
+                self.operate_and_get_next = Some(self.history_recall_pos);
+                self.handle_editor_event(prompt, ReedlineEvent::Submit)
+            }
+            ReedlineEvent::HistorySearch {
+                direction,
+                anchored,
+            } => self.history_search_line(direction, anchored),
             ReedlineEvent::HistoryHintComplete => Ok(self.accept_history_hint(true)),
             ReedlineEvent::HistoryHintWordComplete => Ok(self.accept_history_hint(false)),
             ReedlineEvent::Esc => {
@@ -2726,6 +2873,253 @@ impl Reedline {
         self.input_mode = InputMode::HistorySearch;
     }
 
+    /// The command line of the history entry `skip` entries before the
+    /// current history position — `rl_yank_nth_arg_internal`'s
+    /// `previous_history()` chain (kill.c:613-617): `skip` of 0 is the
+    /// immediately previous entry (the newest one at the live line).
+    ///
+    /// Returns `Ok(None)` when fewer than `skip + 1` entries precede the
+    /// position — GNU's `previous_history()` returns `NULL` there and
+    /// the caller dings.
+    fn history_line_at_skip(&self, skip: i64) -> Result<Option<HistoryItem>> {
+        let results = self.history.search(SearchQuery {
+            direction: SearchDirection::Backward,
+            start_time: None,
+            end_time: None,
+            start_id: self.history_recall_pos,
+            end_id: None,
+            limit: Some(skip + 1),
+            filter: SearchFilter::anything(self.get_history_session_id()),
+        })?;
+        Ok(if results.len() as i64 == skip + 1 {
+            results.into_iter().last()
+        } else {
+            None
+        })
+    }
+
+    /// Insert one argument of a history entry — the shared tail of
+    /// `yank_last_arg`/`yank_nth_arg`, GNU `history_arg_extract` +
+    /// `rl_insert_text` (kill.c:628-644).
+    ///
+    /// `arg` is `None` for `'$'` (the last token); `Some(n)` indexes
+    /// with 0 = command name, negatives counting back from the end —
+    /// the same indexing `history_arg_extract(first, last, string)`
+    /// uses (histexpand.c:1424).
+    ///
+    /// Caveat vs GNU: `history_arg_extract` tokenizes with full shell
+    /// quoting rules (`history_tokenize`); this uses a whitespace
+    /// split, so `"two words"` counts as two arguments, not one.
+    fn yank_history_arg(&mut self, entry: &HistoryItem, arg: Option<i32>) -> EventStatus {
+        let tokens: Vec<&str> = entry.command_line.split_whitespace().collect();
+        let len = tokens.len() as i64;
+        let index = match arg {
+            // `'$'` is the last argument (kill.c:676 passes it through
+            // when no explicit arg was given).
+            None => len - 1,
+            Some(n) if n >= 0 => n as i64,
+            Some(n) => len + n as i64 - 1,
+        };
+        if index < 0 || index >= len {
+            // `!arg || !*arg` → `rl_ding` (kill.c:631).
+            return EventStatus::Inapplicable;
+        }
+        self.run_edit_commands(&[EditCommand::InsertString(
+            tokens[index as usize].to_string(),
+        )]);
+        EventStatus::Handled
+    }
+
+    /// GNU `yank-last-arg` (`M-.`/`M-_`, kill.c:649 `rl_yank_last_arg`):
+    /// yank an argument of the previous history line; a consecutive
+    /// repeat undoes the previous yank and walks `history_skip`
+    /// progressively older entries.
+    fn yank_last_arg(&mut self, count: Option<i32>) -> Result<EventStatus> {
+        let continuing = self.yank_last_arg.is_some();
+        let mut state = self.yank_last_arg.take().unwrap_or(YankLastArgState {
+            history_skip: 0,
+            explicit_arg: count.is_some(),
+            count: count.unwrap_or(0),
+            direction: 1,
+            undo_needed: false,
+        });
+
+        if continuing {
+            if state.undo_needed {
+                // GNU `rl_do_undo` of the insert group
+                // (kill.c:663-665) — our `InsertString` is always its
+                // own undo point, so one `Undo` removes it.
+                self.run_edit_commands(&[EditCommand::Undo]);
+                state.undo_needed = false;
+            }
+            if count.is_some_and(|c| c < 0) {
+                state.direction = -state.direction;
+            }
+            state.history_skip += state.direction;
+            if state.history_skip < 0 {
+                state.history_skip = 0;
+            }
+        }
+
+        let status = match self.history_line_at_skip(state.history_skip)? {
+            Some(entry) => self.yank_history_arg(&entry, state.explicit_arg.then_some(state.count)),
+            // `entry == 0` → `rl_ding` (kill.c:621). A failed press
+            // still consumes the skip step, as in GNU
+            // (`undo_needed` stays false but `history_skip` advanced).
+            None => EventStatus::Inapplicable,
+        };
+        state.undo_needed = matches!(status, EventStatus::Handled);
+        self.yank_last_arg = Some(state);
+        Ok(status)
+    }
+
+    /// GNU `yank-nth-arg` (`M-C-y`, kill.c:644 `rl_yank_nth_arg` →
+    /// `rl_yank_nth_arg_internal` with `history_skip` 0): insert the
+    /// `count`th argument of the previous history line. Single-shot —
+    /// unlike `yank_last_arg` it never walks.
+    fn yank_nth_arg(&mut self, count: i32) -> Result<EventStatus> {
+        Ok(match self.history_line_at_skip(0)? {
+            Some(entry) => self.yank_history_arg(&entry, Some(count)),
+            None => EventStatus::Inapplicable,
+        })
+    }
+
+    /// `rl_operate_and_get_next`'s startup hook (misc.c:770-789
+    /// `set_saved_history`): on the `read_line` after a `C-o`, preload
+    /// the entry after the history position the submitted line was at,
+    /// and seed the history cursor so `Up`/`Down` continue from it.
+    fn apply_operate_and_get_next(&mut self) {
+        let Some(target) = self.operate_and_get_next.take() else {
+            return;
+        };
+        // `None` inside: the submitted line sat at the live position —
+        // the next entry number doesn't exist yet (GNU
+        // `where_history()+history_base+1` past the end), so the new
+        // line stays empty.
+        let Some(after) = target else { return };
+        let next = self
+            .history
+            .search(SearchQuery {
+                direction: SearchDirection::Forward,
+                start_time: None,
+                end_time: None,
+                // `start_id` is exclusive — the first entry strictly
+                // after `after`, which survives the accepted command's
+                // own `save` growing the history (GNU's absolute history
+                // number gives the same durability).
+                start_id: Some(after),
+                end_id: None,
+                limit: Some(1),
+                filter: SearchFilter::anything(self.get_history_session_id()),
+            })
+            .ok()
+            .and_then(|mut results| results.pop());
+        if let Some(item) = next {
+            self.history_recall_pos = item.id;
+            self.editor
+                .set_buffer(item.command_line.clone(), UndoBehavior::CreateUndoPoint);
+            self.history_cursor = HistoryCursor::new(
+                HistoryNavigationQuery::Normal(LineBuffer::default()),
+                self.get_history_session_id(),
+            );
+            self.history_cursor.set_current(item);
+            self.input_mode = InputMode::HistoryTraversal;
+        }
+    }
+
+    /// GNU `history-search-backward`/`forward` (search.c:713/675) when
+    /// `anchored`, `history-substr-search-backward`/`forward`
+    /// (search.c:750/732) otherwise: search history for entries
+    /// matching the buffer up to the insertion point.
+    fn history_search_line(&mut self, direction: Direction, anchored: bool) -> Result<EventStatus> {
+        let search_dir = match direction {
+            Direction::Backward => SearchDirection::Backward,
+            Direction::Forward => SearchDirection::Forward,
+        };
+        // The `rl_last_func` reinit guards (search.c:701,737,755): only
+        // a consecutive press of the *same* family continues the search
+        // position; a first press or a family switch reinitializes from
+        // the current buffer.
+        let continuing = self
+            .history_line_search
+            .as_ref()
+            .is_some_and(|s| s.anchored == anchored);
+        if !continuing {
+            let search_len = self.editor.insertion_point();
+            let needle = self.editor.get_buffer()[..search_len].to_string();
+            self.history_line_search = Some(HistoryLineSearch {
+                anchored,
+                search_len,
+            });
+            if needle.is_empty() {
+                // `_rl_history_search_len == 0` degrades to plain
+                // previous/next-history (search.c:708,720).
+                match search_dir {
+                    SearchDirection::Backward => self.previous_history()?,
+                    SearchDirection::Forward => self.next_history()?,
+                }
+                return Ok(EventStatus::Handled);
+            }
+            let query = if anchored {
+                HistoryNavigationQuery::PrefixSearch(needle)
+            } else {
+                HistoryNavigationQuery::SubstringSearch(needle)
+            };
+            // The cursor carries the search (query + position);
+            // `input_mode` is deliberately not HistoryTraversal so a
+            // following plain Up/Down starts a fresh walk from the
+            // buffer, as GNU's `get_previous_history` does after a
+            // `history-search-*` command.
+            self.history_cursor = HistoryCursor::new(query, self.get_history_session_id());
+        }
+        match search_dir {
+            SearchDirection::Backward => self.history_cursor.back(self.history.as_ref())?,
+            SearchDirection::Forward => self.history_cursor.forward(self.history.as_ref())?,
+        }
+
+        if let Some(found) = self.history_cursor.string_at_cursor() {
+            self.history_recall_pos = self.history_cursor.id_at_cursor();
+            // GNU's point placement (search.c:635-644): anchored lands
+            // on `_rl_history_search_len`; substring lands on the match
+            // offset `newcol` (GNU also sets `rl_mark` to the line end,
+            // which reedline has no analog for).
+            let point = if anchored {
+                self.history_line_search
+                    .as_ref()
+                    .map_or(0, |s| s.search_len)
+            } else {
+                match self.history_cursor.get_navigation() {
+                    HistoryNavigationQuery::SubstringSearch(needle) => {
+                        found.find(&needle).unwrap_or(found.len())
+                    }
+                    _ => found.len(),
+                }
+            };
+            self.editor
+                .set_buffer(found, UndoBehavior::HistoryNavigation);
+            let point = point.min(self.editor.get_buffer().len());
+            self.editor.edit_buffer(
+                |buf| buf.set_insertion_point(point),
+                UndoBehavior::MoveCursor,
+            );
+            self.editor.commit_cursor();
+            Ok(EventStatus::Handled)
+        } else {
+            // Search failed — GNU `rl_ding`s and restores the point to
+            // `_rl_history_search_len` while the buffer keeps the last
+            // found line (search.c:626, `temp == 0` arm).
+            if let Some(state) = &self.history_line_search {
+                let point = state.search_len.min(self.editor.get_buffer().len());
+                self.editor.edit_buffer(
+                    |buf| buf.set_insertion_point(point),
+                    UndoBehavior::MoveCursor,
+                );
+                self.editor.commit_cursor();
+            }
+            Ok(EventStatus::Inapplicable)
+        }
+    }
+
     /// Dispatches the applicable [`EditCommand`] actions for editing the history search string.
     ///
     /// Only modifies internal state, does not perform regular output!
@@ -2774,6 +3168,10 @@ impl Reedline {
     /// When using the up/down traversal or fish/zsh style prefix search update the main line buffer accordingly.
     /// Not used for the separate modal reverse search!
     fn update_buffer_from_history(&mut self) {
+        // Track the history position the buffer now shows — reedline's
+        // `where_history()` for `OperateAndGetNext`/`YankLastArg`.
+        // `None` means the live line (walked past the newest entry).
+        self.history_recall_pos = self.history_cursor.id_at_cursor();
         if self.history_last_run.is_recalled() {
             if let HistoryLastRun::Excluded { item, .. } = &self.history_last_run {
                 self.editor
@@ -9854,7 +10252,6 @@ mod tests {
 
         assert_eq!(command_into_string(actual), expected);
     }
-
     // === GNU kill ring + yank-pop (kill.c, readline.c:715-716) ===
 
     /// Type a string one `ch` event at a time, each its own batch.
@@ -10060,5 +10457,367 @@ mod tests {
         drive(&mut rl, &[ch('x'), ch('x')]);
         assert_eq!(rl.editor.get_buffer(), "");
         assert_eq!(rl.editor.current_kill(), ("a".to_string(), 1));
+    }
+    // ---- GNU readline feature coverage ----
+
+    fn seed_history(rl: &mut Reedline, entries: &[&str]) {
+        for entry in entries {
+            rl.history
+                .save(HistoryItem::from_command_line(*entry))
+                .expect("failed to save history");
+        }
+    }
+
+    fn ctrl_alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT)
+    }
+
+    // --- revert-line (undo.c:331) ---
+
+    #[test]
+    fn revert_line_undoes_every_change() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('a'), ch('b'), ch('c')]);
+        assert_eq!(rl.editor.get_buffer(), "abc");
+
+        drive(&mut rl, &[alt('r')]);
+        assert_eq!(rl.editor.get_buffer(), "");
+    }
+
+    #[test]
+    fn revert_line_meta_ctrl_r_binds_too() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('x')]);
+
+        drive(&mut rl, &[ctrl_alt('r')]);
+        assert_eq!(rl.editor.get_buffer(), "");
+    }
+
+    #[test]
+    fn revert_line_on_untouched_buffer_is_inapplicable() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        let status = rl
+            .handle_editor_event(
+                &DefaultPrompt::default(),
+                ReedlineEvent::Edit(vec![EditCommand::RevertLine]),
+            )
+            .unwrap();
+        assert!(matches!(status, EventStatus::Inapplicable));
+    }
+
+    // --- character-search (text.c:1829) ---
+
+    #[test]
+    fn char_search_forward_lands_on_next_match() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('h'), ch('e'), ch('l'), ch('l'), ch('o')]);
+        // C-a to the line start, then C-] 'l' in one batch — the armed
+        // flag consumes the following Char at parse time.
+        drive(&mut rl, &[ctrl('a')]);
+        drive(&mut rl, &[ctrl(']'), ch('l')]);
+        assert_eq!(rl.editor.insertion_point(), 2);
+    }
+
+    #[test]
+    fn char_search_backward_lands_on_previous_match() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('h'), ch('e'), ch('l'), ch('l'), ch('o')]);
+        // Cursor at end; M-C-] 'l' lands on the last 'l' before point.
+        drive(&mut rl, &[ctrl_alt(']'), ch('l')]);
+        assert_eq!(rl.editor.insertion_point(), 3);
+    }
+
+    #[test]
+    fn char_search_miss_leaves_cursor() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('a'), ch('b')]);
+        drive(&mut rl, &[ctrl('a')]);
+        drive(&mut rl, &[ctrl(']'), ch('z')]);
+        assert_eq!(rl.editor.insertion_point(), 0);
+    }
+
+    #[test]
+    fn char_search_skips_char_under_cursor() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('l'), ch('o'), ch('l')]);
+        drive(&mut rl, &[ctrl('a')]);
+        // Sitting on 'l' at 0, C-] 'l' must find the NEXT 'l' at 2.
+        drive(&mut rl, &[ctrl(']'), ch('l')]);
+        assert_eq!(rl.editor.insertion_point(), 2);
+    }
+
+    // --- yank-last-arg / yank-nth-arg (kill.c:603-702) ---
+
+    #[test]
+    fn yank_last_arg_inserts_last_token_of_previous_entry() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["ls one two"]);
+
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "two");
+    }
+
+    #[test]
+    fn yank_last_arg_appends_at_cursor() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["ls one two"]);
+        type_each(&mut rl, &[ch('s'), ch('u'), ch('d'), ch('o'), ch(' ')]);
+
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "sudo two");
+    }
+
+    #[test]
+    fn yank_last_arg_repeat_walks_older_entries() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["ls a b", "echo x y", "vim f g"]);
+
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "g");
+        // Each repeat undoes the last insert and takes the last arg
+        // of the next-older entry.
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "y");
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "b");
+        // Past the oldest entry GNU dings — and because the repeat
+        // undoes the previous yank BEFORE retrying the extract
+        // (kill.c:663-665), the failed press leaves the arg removed.
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "");
+    }
+
+    #[test]
+    fn yank_last_arg_chain_breaks_on_other_input() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["ls a b", "echo x y", "vim f g"]);
+
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "g");
+        // Typing resets the walk: the next M-. starts at the newest
+        // entry again.
+        drive(&mut rl, &[ch(' ')]);
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "g g");
+    }
+
+    #[test]
+    fn yank_nth_arg_inserts_indexed_arg() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["cmd arg1 arg2"]);
+
+        drive(&mut rl, &[ctrl_alt('y')]);
+        assert_eq!(rl.editor.get_buffer(), "arg1");
+    }
+
+    #[test]
+    fn yank_last_arg_empty_history_dings() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "");
+    }
+
+    // --- operate-and-get-next (misc.c:782) ---
+
+    #[test]
+    fn operate_and_get_next_preloads_following_entry() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["one", "two", "three"]);
+
+        // Recall "two" (one above the newest), then C-o: the line
+        // submits, and the next read_line preloads "three" — the entry
+        // after the recalled position.
+        drive(&mut rl, &[key(KeyCode::Up), key(KeyCode::Up)]);
+        assert_eq!(rl.editor.get_buffer(), "two");
+        let flow = step_key(&mut rl, ctrl('o'));
+        assert!(
+            matches!(flow, ControlFlow::Break(Signal::Success(ref s)) if s == "two"),
+            "C-o submits the recalled line"
+        );
+
+        rl.begin_read();
+        rl.apply_operate_and_get_next();
+        assert_eq!(rl.editor.get_buffer(), "three");
+    }
+
+    #[test]
+    fn operate_and_get_next_on_fresh_line_stays_empty() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["one", "two"]);
+        type_each(&mut rl, &[ch('x')]);
+
+        let flow = step_key(&mut rl, ctrl('o'));
+        assert!(
+            matches!(flow, ControlFlow::Break(Signal::Success(ref s)) if s == "x"),
+            "C-o submits the fresh line"
+        );
+
+        rl.begin_read();
+        rl.apply_operate_and_get_next();
+        assert_eq!(rl.editor.get_buffer(), "");
+    }
+
+    #[test]
+    fn operate_and_get_next_after_walk_back_to_live_line_stays_empty() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["one", "two"]);
+
+        // Recall an entry then walk back to the live line: the history
+        // position is the end, so there is no next entry to preload.
+        drive(&mut rl, &[key(KeyCode::Up), key(KeyCode::Down)]);
+        type_each(&mut rl, &[ch('z')]);
+        let flow = step_key(&mut rl, ctrl('o'));
+        assert!(matches!(flow, ControlFlow::Break(Signal::Success(ref s)) if s == "z"));
+
+        rl.begin_read();
+        rl.apply_operate_and_get_next();
+        assert_eq!(rl.editor.get_buffer(), "");
+    }
+
+    // --- history-search / history-substr-search (search.c) ---
+
+    #[test]
+    fn history_search_backward_anchored_walks_prefix_matches() {
+        let mut rl = seam_engine(emacs_with(
+            KeyModifiers::ALT,
+            KeyCode::Char('p'),
+            ReedlineEvent::HistorySearch {
+                direction: Direction::Backward,
+                anchored: true,
+            },
+        ));
+        seed_history(&mut rl, &["ls foo", "cd bar", "ls baz"]);
+        type_each(&mut rl, &[ch('l'), ch('s')]);
+
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "ls baz");
+        // Anchored search lands the point at the needle's end.
+        assert_eq!(rl.editor.insertion_point(), 2);
+
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "ls foo");
+        assert_eq!(rl.editor.insertion_point(), 2);
+    }
+
+    #[test]
+    fn history_search_forward_returns_through_matches() {
+        let mut kb = crate::default_emacs_keybindings();
+        kb.add_binding(
+            KeyModifiers::ALT,
+            KeyCode::Char('p'),
+            ReedlineEvent::HistorySearch {
+                direction: Direction::Backward,
+                anchored: true,
+            },
+        );
+        kb.add_binding(
+            KeyModifiers::ALT,
+            KeyCode::Char('n'),
+            ReedlineEvent::HistorySearch {
+                direction: Direction::Forward,
+                anchored: true,
+            },
+        );
+        let mut rl = seam_engine(Box::new(crate::Emacs::new(kb)));
+        seed_history(&mut rl, &["ls foo", "cd bar", "ls baz"]);
+        type_each(&mut rl, &[ch('l'), ch('s')]);
+
+        drive(&mut rl, &[alt('p')]);
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "ls foo");
+        drive(&mut rl, &[alt('n')]);
+        assert_eq!(rl.editor.get_buffer(), "ls baz");
+        assert_eq!(rl.editor.insertion_point(), 2);
+    }
+
+    #[test]
+    fn history_substr_search_lands_on_match_offset() {
+        let mut rl = seam_engine(emacs_with(
+            KeyModifiers::ALT,
+            KeyCode::Char('p'),
+            ReedlineEvent::HistorySearch {
+                direction: Direction::Backward,
+                anchored: false,
+            },
+        ));
+        seed_history(&mut rl, &["ls foo", "cd bar", "ls baz"]);
+        type_each(&mut rl, &[ch('b'), ch('a')]);
+
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "ls baz");
+        // Substring search lands the point on the match offset
+        // (GNU `rl_point = newcol`).
+        assert_eq!(rl.editor.insertion_point(), 3);
+
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "cd bar");
+        assert_eq!(rl.editor.insertion_point(), 3);
+    }
+
+    #[test]
+    fn history_search_empty_needle_walks_history() {
+        let mut rl = seam_engine(emacs_with(
+            KeyModifiers::ALT,
+            KeyCode::Char('p'),
+            ReedlineEvent::HistorySearch {
+                direction: Direction::Backward,
+                anchored: true,
+            },
+        ));
+        seed_history(&mut rl, &["one", "two"]);
+
+        // `_rl_history_search_len == 0` → plain previous-history.
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "two");
+    }
+
+    #[test]
+    fn history_search_failed_keeps_last_match() {
+        let mut rl = seam_engine(emacs_with(
+            KeyModifiers::ALT,
+            KeyCode::Char('p'),
+            ReedlineEvent::HistorySearch {
+                direction: Direction::Backward,
+                anchored: true,
+            },
+        ));
+        seed_history(&mut rl, &["ls foo", "cd bar", "ls baz"]);
+        type_each(&mut rl, &[ch('l'), ch('s')]);
+
+        drive(&mut rl, &[alt('p')]);
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "ls foo");
+        // A failing press dings: buffer keeps the last match, point
+        // goes back to the needle length.
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "ls foo");
+        assert_eq!(rl.editor.insertion_point(), 2);
+    }
+
+    #[test]
+    fn history_search_resets_after_other_input() {
+        let mut rl = seam_engine(emacs_with(
+            KeyModifiers::ALT,
+            KeyCode::Char('p'),
+            ReedlineEvent::HistorySearch {
+                direction: Direction::Backward,
+                anchored: true,
+            },
+        ));
+        seed_history(&mut rl, &["ls foo", "cd bar", "ls baz"]);
+        type_each(&mut rl, &[ch('l'), ch('s')]);
+
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "ls baz");
+        // An intervening edit reinitializes (GNU's `rl_last_func`
+        // check): the search landed the point at 2, so '!' inserts
+        // there and the next search re-reads the needle from the
+        // current buffer — "ls!" matches no entry, and the failed
+        // search leaves the edited buffer alone (search.c:626).
+        drive(&mut rl, &[ch('!')]);
+        assert_eq!(rl.editor.get_buffer(), "ls! baz");
+        drive(&mut rl, &[alt('p')]);
+        assert_eq!(rl.editor.get_buffer(), "ls! baz");
+        assert_eq!(rl.editor.insertion_point(), 3);
     }
 }

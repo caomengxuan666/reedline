@@ -1405,6 +1405,94 @@ pub enum ReedlineEvent {
     /// GNU's `rl_quoted_insert`, which reads one input character
     /// verbatim.
     QuotedInsert,
+
+    /// Read one key, then move the cursor to that character's next
+    /// occurrence in `direction` — GNU readline `character-search`
+    /// (`C-]`, text.c:1829 `rl_char_search` / `rl_backward_char_search`,
+    /// `M-C-]`). GNU's `FFIND`/`BFIND` land *on* the match and skip the
+    /// character under the cursor; the move resolves to a no-op (and
+    /// the event reports inapplicable) when the character isn't found.
+    ///
+    /// The key after this event is consumed as the search target, the
+    /// same interception [`ReedlineEvent::QuotedInsert`] performs — a
+    /// `Char` key supplies the target character; any other key cancels
+    /// the search. Emacs default: `C-]` forward, `M-C-]` backward.
+    CharSearch {
+        /// Which way to search for the typed character
+        direction: Direction,
+    },
+
+    /// Insert an argument from the previous history line — GNU readline
+    /// `yank-last-arg` (`M-.`/`M-_`) and, with an explicit argument,
+    /// `yank-nth-arg` (kill.c:603-702).
+    ///
+    /// `count: None` yanks the last argument (GNU `'$'`); `Some(n)`
+    /// yanks argument `n`, where 0 is the command name and negatives
+    /// count back from the end. A consecutive repeat undoes the
+    /// previous insert and yanks the same argument from the
+    /// progressively older entry (GNU's `history_skip` walk); a negative
+    /// `count` on a repeat flips the walk direction, as in GNU.
+    ///
+    /// Caveat: GNU tokenizes the entry with full shell quoting rules
+    /// (`history_arg_extract`, histexpand.c:1424); this implementation
+    /// splits on whitespace, so a quoted `"two words"` counts as two
+    /// arguments here.
+    YankLastArg {
+        /// Which argument to yank — `None` for the last
+        count: Option<i32>,
+    },
+
+    /// Insert the `count`th argument of the previous history line —
+    /// GNU readline `yank-nth-arg` (`M-C-y`, kill.c:644
+    /// `rl_yank_nth_arg`). Unlike [`ReedlineEvent::YankLastArg`] this
+    /// is single-shot: repeating it inserts the same argument again
+    /// instead of walking older entries.
+    YankNthArg {
+        /// Which argument to yank — 0 is the command name, negatives
+        /// count back from the end
+        count: i32,
+    },
+
+    /// Accept the current line, and preload the *next* history entry
+    /// into the following `read_line` — GNU readline
+    /// `operate-and-get-next` (`C-o`, misc.c:782
+    /// `rl_operate_and_get_next`).
+    ///
+    /// The entry preloaded is the one after the history position the
+    /// line was submitted from: recalling entry `k` then pressing `C-o`
+    /// loads `k+1` (which, when `k` was the newest, is the just-accepted
+    /// line — GNU's `where_history()+history_base+1` produces the same).
+    /// On a fresh line there is no following entry and the next prompt
+    /// starts empty. The preload also positions the history cursor, so
+    /// `Up`/`Down` continue from the loaded entry.
+    OperateAndGetNext,
+
+    /// Search history using the buffer up to the insertion point as the
+    /// needle — GNU readline `history-search-backward` /
+    /// `history-search-forward` when `anchored` (search.c:713/675), and
+    /// `history-substr-search-backward` / `history-substr-search-forward`
+    /// otherwise (search.c:750/732).
+    ///
+    /// An anchored search requires the entry to *start with* the needle
+    /// and lands the cursor at the end of the needle; a substring
+    /// search matches anywhere and lands the cursor at the match
+    /// offset (GNU also sets `rl_mark` at the line end — not modeled
+    /// here). Consecutive presses continue the same search in either
+    /// direction; any other event reinitializes from the current
+    /// buffer. With an empty needle the event degrades to plain
+    /// previous/next-history traversal, exactly as GNU's
+    /// `_rl_history_search_len == 0` falls back to
+    /// `rl_get_previous_history`/`rl_get_next_history`.
+    ///
+    /// Not bound in the default emacs map (GNU leaves it unbound too);
+    /// hosts bind it directly, e.g. to `Up`/`Down` or `M-p`/`M-n`.
+    HistorySearch {
+        /// Older entries (`Backward`) or newer ones (`Forward`)
+        direction: Direction,
+        /// `true` for an anchored prefix match (GNU `history-search-*`),
+        /// `false` for a substring match (GNU `history-substr-search-*`)
+        anchored: bool,
+    },
 }
 
 pub enum EventStatus {

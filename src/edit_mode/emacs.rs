@@ -7,7 +7,7 @@ use crate::{
         parse_non_key_event, EditMode,
     },
     enums::{EditCommand, EventStatus, ReedlineEvent, ReedlineRawEvent},
-    PromptEditMode,
+    Direction, PromptEditMode,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
@@ -45,6 +45,65 @@ pub fn default_emacs_keybindings() -> Keybindings {
     // Undo/Redo
     kb.add_binding(KM::CONTROL, KC::Char('g'), edit_bind(EC::Redo));
     kb.add_binding(KM::CONTROL, KC::Char('z'), edit_bind(EC::Undo));
+    // GNU revert-line (undo.c:331): M-r and M-C-r undo every change to
+    // the current line (emacs_keymap.c:445 and :336 respectively).
+    kb.add_binding(KM::ALT, KC::Char('r'), edit_bind(EC::RevertLine));
+    kb.add_binding(
+        KM::CONTROL | KM::ALT,
+        KC::Char('r'),
+        edit_bind(EC::RevertLine),
+    );
+    // GNU character-search (text.c:1829): C-] reads a char and moves to
+    // its next occurrence, M-C-] searches backward
+    // (emacs_keymap.c:64 and :348).
+    kb.add_binding(
+        KM::CONTROL,
+        KC::Char(']'),
+        ReedlineEvent::CharSearch {
+            direction: Direction::Forward,
+        },
+    );
+    kb.add_binding(
+        KM::CONTROL | KM::ALT,
+        KC::Char(']'),
+        ReedlineEvent::CharSearch {
+            direction: Direction::Backward,
+        },
+    );
+    // GNU yank-last-arg / yank-nth-arg (kill.c:603-702): M-. and M-_
+    // yank the last argument of the previous history line, M-C-y the
+    // first (emacs_keymap.c:367, :424, :343). Alt-underscore arrives as
+    // Alt-Shift-hyphen on most terminals, so both spellings bind.
+    kb.add_binding(
+        KM::ALT,
+        KC::Char('.'),
+        ReedlineEvent::YankLastArg { count: None },
+    );
+    kb.add_binding(
+        KM::ALT,
+        KC::Char('_'),
+        ReedlineEvent::YankLastArg { count: None },
+    );
+    kb.add_binding(
+        KM::ALT | KM::SHIFT,
+        KC::Char('-'),
+        ReedlineEvent::YankLastArg { count: None },
+    );
+    kb.add_binding(
+        KM::ALT | KM::SHIFT,
+        KC::Char('_'),
+        ReedlineEvent::YankLastArg { count: None },
+    );
+    kb.add_binding(
+        KM::CONTROL | KM::ALT,
+        KC::Char('y'),
+        ReedlineEvent::YankNthArg { count: 1 },
+    );
+    // GNU operate-and-get-next (misc.c:782): emacs C-o accepts the line
+    // and preloads the next history entry into the next read_line
+    // (emacs_keymap.c:50). Overrides the common map's OpenEditor, which
+    // stays bound in the vi/helix maps — GNU leaves vi C-o unbound.
+    kb.add_binding(KM::CONTROL, KC::Char('o'), ReedlineEvent::OperateAndGetNext);
     // Cutting
     // GNU C-y is `rl_yank` (kill.c:509) — the kill ring's current slot —
     // and M-y is `rl_yank_pop` (kill.c:527, emacs_keymap.c Meta-y).
