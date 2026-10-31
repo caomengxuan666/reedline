@@ -2325,6 +2325,36 @@ impl Reedline {
         Ok(ControlFlow::Continue(()))
     }
 
+    /// GNU `rl_stop` (signals.c) — suspend inside `read_line`: deprep
+    /// the terminal, raise `SIGTSTP`, and on `SIGCONT` re-prep and
+    /// repaint so the edit continues exactly where it stopped. On
+    /// platforms without job-control signals this is an inapplicable
+    /// no-op.
+    fn suspend(&mut self, prompt: &dyn Prompt) -> Result<EventStatus> {
+        #[cfg(unix)]
+        {
+            // Same suspend/resume shape `ExecuteHostCommand` uses:
+            // remember the painter state, leave raw mode, stop, and on
+            // resume re-prep + full repaint.
+            self.suspended_state = Some(self.painter.state_before_suspension());
+            self.painter.move_cursor_to_end()?;
+            let _ignore = terminal::disable_raw_mode();
+            let _ignore = rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::TSTP,
+            );
+            // Resumed (SIGCONT): restore the editor's terminal state.
+            let _ignore = terminal::enable_raw_mode();
+            self.repaint(prompt)?;
+            Ok(EventStatus::Handled)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = prompt;
+            Ok(EventStatus::Inapplicable)
+        }
+    }
+
     fn handle_event(&mut self, prompt: &dyn Prompt, event: ReedlineEvent) -> Result<EventStatus> {
         // A replayed key sequence is input, not an action: it queues at the
         // head of the next input batch and resolves through whatever keymap
@@ -2332,6 +2362,9 @@ impl Reedline {
         if let ReedlineEvent::KeySequence(keys) = event {
             self.enqueue_replayed_keys(keys, self.replay_depth + 1);
             return Ok(EventStatus::Handled);
+        }
+        if event == ReedlineEvent::Suspend {
+            return self.suspend(prompt);
         }
         // The terminating key of a numeric argument is dispatched under
         // the count (GNU `_rl_arg_dispatch`, misc.c:174). Our events take
@@ -2558,6 +2591,7 @@ impl Reedline {
             | ReedlineEvent::MenuRight
             | ReedlineEvent::MenuPageNext
             | ReedlineEvent::MenuPagePrevious
+            | ReedlineEvent::Suspend
             | ReedlineEvent::SwitchMode(_) => Ok(EventStatus::Inapplicable),
         }
     }
@@ -3061,6 +3095,7 @@ impl Reedline {
             | ReedlineEvent::CallLastKbdMacro
             | ReedlineEvent::DigitArgument(_)
             | ReedlineEvent::UniversalArgument
+            | ReedlineEvent::Suspend
             | ReedlineEvent::WithArg { .. } => Ok(EventStatus::Inapplicable),
         }
     }
@@ -6048,6 +6083,21 @@ mod tests {
             &[KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE), ch('z')],
         );
         assert_eq!(rl.editor.get_buffer(), "abxyz");
+    }
+
+    /// C-z is bound to `Suspend` (GNU rl_suspend), undo moved to C-_.
+    #[test]
+    fn ctrl_z_maps_to_suspend() {
+        let kb = crate::default_emacs_keybindings();
+        assert_eq!(
+            kb.find_binding(KeyModifiers::CONTROL, KeyCode::Char('z')),
+            Some(ReedlineEvent::Suspend)
+        );
+        let vi = crate::default_vi_insert_keybindings();
+        assert_eq!(
+            vi.find_binding(KeyModifiers::CONTROL, KeyCode::Char('z')),
+            Some(ReedlineEvent::Suspend)
+        );
     }
 
     #[test]

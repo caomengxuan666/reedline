@@ -1573,6 +1573,13 @@ pub enum ReedlineEvent {
     /// Insert key): `None` toggles, `Some(on)` sets explicitly — the
     /// explicit-arg form in GNU (`arg>0` overwrites, `arg<=0` inserts).
     OverwriteMode(Option<bool>),
+
+    /// Suspend the editor like GNU `rl_suspend`/`rl_stop` (signals.c):
+    /// the terminal is deprepped, `SIGTSTP` is raised to the own
+    /// process, and on resume (`SIGCONT`) the terminal is re-prepped
+    /// and the line repainted — all inside `read_line`, transparent to
+    /// the host. No-op on platforms without job control signals.
+    Suspend,
 }
 
 pub enum EventStatus {
