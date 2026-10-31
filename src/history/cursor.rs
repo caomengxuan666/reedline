@@ -117,6 +117,21 @@ impl HistoryCursor {
         self.current.as_ref().map(|e| e.command_line.to_string())
     }
 
+    /// Returns the [`HistoryItemId`] of the entry at the cursor, if any
+    /// — the engine's `where_history()` analog for
+    /// `operate-and-get-next` and `yank-last-arg`.
+    pub(crate) fn id_at_cursor(&self) -> Option<super::HistoryItemId> {
+        self.current.as_ref().and_then(|e| e.id)
+    }
+
+    /// Seed the cursor onto a known entry — used by
+    /// `operate-and-get-next`'s preload so navigation continues from
+    /// the loaded entry (GNU `set_saved_history` positioning the
+    /// history pointer, misc.c).
+    pub(crate) fn set_current(&mut self, item: HistoryItem) {
+        self.current = Some(item);
+    }
+
     /// Poll the current [`HistoryNavigationQuery`] mode
     pub fn get_navigation(&self) -> HistoryNavigationQuery {
         self.query.clone()

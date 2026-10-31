@@ -34,6 +34,31 @@ where
         &self.current
     }
 
+    /// Undo every recorded change, landing on the oldest state — GNU
+    /// readline `rl_revert_line` (undo.c:331), which loops `rl_do_undo`
+    /// until the undo list is empty.
+    ///
+    /// Returns `false` when there was nothing to undo, matching GNU's
+    /// `rl_ding` on an empty `rl_undo_list`. The walked states stay on
+    /// the redo stack (our undo keeps a redo side GNU lacks).
+    ///
+    /// Caveat: the bottom of this stack is the state captured when the
+    /// stack started recording for this line (the session-start
+    /// buffer), not the per-history-entry original GNU keeps in
+    /// `entry->data` — reedline's history navigation coalesces into one
+    /// undo entry per hop, so a recall followed by edits reverts to the
+    /// live line as it was before traversal began.
+    pub(super) fn undo_all(&mut self) -> bool {
+        if self.undo.is_empty() {
+            return false;
+        }
+        while let Some(prev) = self.undo.pop() {
+            let cur = std::mem::replace(&mut self.current, prev);
+            self.redo.push(cur);
+        }
+        true
+    }
+
     /// Go forward one point in the undo stack. If present on the last edit do nothing
     pub(super) fn redo(&mut self) -> &T {
         if let Some(next) = self.redo.pop() {
@@ -102,6 +127,23 @@ mod test {
 
         let value = stack.redo();
         assert_eq!(*value, value_after_undo);
+    }
+
+    #[test]
+    fn undo_all_walks_to_the_bottom() {
+        let mut stack = edit_stack(&[1, 2, 3][..], 2);
+
+        assert!(stack.undo_all());
+        assert_eq!(*stack.current(), 1);
+        // Every undone state stays redoable, oldest change first.
+        assert_eq!(*stack.redo(), 2);
+        assert_eq!(*stack.redo(), 3);
+    }
+
+    #[test]
+    fn undo_all_on_empty_stack_is_a_noop() {
+        let mut stack = EditStack::<isize>::new();
+        assert!(!stack.undo_all());
     }
 
     #[rstest]
