@@ -75,7 +75,12 @@ pub fn default_vi_insert_keybindings() -> Keybindings {
     add_common_edit_bindings(&mut kb);
     add_common_selection_bindings(&mut kb);
 
-    // GNU vi-insert binds C-z to suspend too (vi_keymap.c).
+    // GNU vi-insert's keymap actually binds C-z to rl_insert
+    // (vi_keymap.c:340) — the slot is never *reached* because the tty
+    // driver's VSUSP char delivers SIGTSTP to the foreground pgrp
+    // before readline reads the byte (signals.c). Reedline runs raw
+    // mode with ISIG off, so reproducing the observable behavior —
+    // C-z suspends — requires this explicit binding.
     kb.add_binding(
         KeyModifiers::CONTROL,
         KeyCode::Char('z'),
