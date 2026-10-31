@@ -1,6 +1,7 @@
+use crate::core_editor::EditCommandStatus;
+use crate::PromptEditMode;
 use crossterm::event::{Event, KeyEvent, KeyEventKind};
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
 use strum::{EnumDiscriminants, EnumIter, EnumString, VariantArray};
 
 /// Which mouse button was pressed.
@@ -35,6 +36,15 @@ pub enum Signal {
     CtrlC, // Interrupt current editing
     /// Abort with `Ctrl+D` signalling `EOF` or abort of a whole interactive session
     CtrlD, // End terminal session
+
+    /// A custom, uninterpreted payload passed back to the host application.
+    ///
+    /// This signal is triggered by a [`ReedlineEvent::ExecuteHostCommand`].
+    /// The contained string is a "passthrough" value that Reedline does not
+    /// inspect or modify; it is up to the caller to define the protocol
+    /// and execution logic for this payload.
+    HostCommand(String),
+
     /// An external signal requested that `read_line()` return.
     /// Contains the current buffer contents at the time of interruption.
     ExternalBreak(String),
@@ -49,6 +59,34 @@ pub enum TextObjectScope {
     Around,
 }
 
+/// Text object quote types
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum TextObjectQuote {
+    /// '
+    SingleQuote,
+    /// "
+    DoubleQuote,
+    /// \`
+    Tick,
+    /// ', ", \`
+    All,
+}
+
+/// Text object bracket types
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum TextObjectBracket {
+    /// (, )
+    Parenthesis,
+    /// \[, ]
+    SquareBracket,
+    /// {, }
+    CurlyBracket,
+    /// <, >
+    AngleBracket,
+    /// (, ), \[, ], {, }, <, >
+    All,
+}
+
 /// Type of text object to operate on
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum TextObjectType {
@@ -56,19 +94,69 @@ pub enum TextObjectType {
     Word,
     /// WORD (delimited only by whitespace)
     BigWord,
-    /// (, ), [, ], {, }
-    Brackets,
-    /// ", ', `
-    Quote,
+    /// Brackets pairs (`(`, `)`, `[`, `]`, `{`, `}`, `<`, `>`)
+    Brackets(TextObjectBracket),
+    /// Quotes pairs (`"`, `'`, `\``)
+    Quotes(TextObjectQuote),
+    /// Custom pair
+    Pair {
+        /// left character of the pair
+        left: char,
+        /// right character of the pair
+        right: char,
+    },
+}
+
+impl TextObjectType {
+    /// Convert a character to its corresponding [`TextObjectType`](Self)
+    pub fn from_char(ch: char) -> Option<Self> {
+        match ch {
+            'w' => Some(Self::Word),
+            'W' => Some(Self::BigWord),
+            '(' | ')' => Some(Self::Brackets(TextObjectBracket::Parenthesis)),
+            '[' | ']' => Some(Self::Brackets(TextObjectBracket::SquareBracket)),
+            '{' | '}' => Some(Self::Brackets(TextObjectBracket::CurlyBracket)),
+            '<' | '>' => Some(Self::Brackets(TextObjectBracket::AngleBracket)),
+            '"' => Some(Self::Quotes(TextObjectQuote::DoubleQuote)),
+            '\'' => Some(Self::Quotes(TextObjectQuote::SingleQuote)),
+            '`' => Some(Self::Quotes(TextObjectQuote::Tick)),
+            _ if !ch.is_ascii_control() && ch.is_ascii() => Some(Self::Pair {
+                left: ch,
+                right: ch,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Returns the pair of character if any is associated
+    pub fn to_chars(self) -> Option<(char, char)> {
+        match self {
+            Self::Word
+            | Self::BigWord
+            | Self::Brackets(TextObjectBracket::All)
+            | Self::Quotes(TextObjectQuote::All) => None,
+            Self::Brackets(TextObjectBracket::Parenthesis) => Some(('(', ')')),
+            Self::Brackets(TextObjectBracket::SquareBracket) => Some(('[', ']')),
+            Self::Brackets(TextObjectBracket::CurlyBracket) => Some(('{', '}')),
+            Self::Brackets(TextObjectBracket::AngleBracket) => Some(('<', '>')),
+            Self::Quotes(TextObjectQuote::SingleQuote) => Some(('\'', '\'')),
+            Self::Quotes(TextObjectQuote::DoubleQuote) => Some(('"', '"')),
+            Self::Quotes(TextObjectQuote::Tick) => Some(('`', '`')),
+            Self::Pair { left, right } => Some((left, right)),
+        }
+    }
 }
 
 /// Text objects that can be operated on with vim-style commands
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
 pub struct TextObject {
     /// Whether to include surrounding context
     pub scope: TextObjectScope,
     /// The type of text object
     pub object_type: TextObjectType,
+    /// check the next text object if no text object found around the cursor
+    pub check_next: bool,
 }
 
 impl Default for TextObject {
@@ -76,6 +164,166 @@ impl Default for TextObject {
         Self {
             scope: TextObjectScope::Inner,
             object_type: TextObjectType::Word,
+            check_next: true,
+        }
+    }
+}
+
+/// Direction a cursor motion travels through the buffer.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// Toward the end of the buffer (right / `w` / `$`).
+    Forward,
+    /// Toward the start of the buffer (left / `b` / `0`).
+    Backward,
+}
+
+impl Direction {
+    pub(crate) fn reversed(self) -> Self {
+        match self {
+            Direction::Forward => Direction::Backward,
+            Direction::Backward => Direction::Forward,
+        }
+    }
+}
+
+/// Which "word" notion a word motion uses.
+///
+/// The flavors differ only in which character-class transitions count as a
+/// boundary; see the classifier in `core_editor::word`.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum WordKind {
+    /// `w`/`b`/`e` — a boundary at any character-class change.
+    Word,
+    /// `W`/`B`/`E` — a boundary only at whitespace/line-ending, so a run like
+    /// `foo.bar` is one WORD.
+    LongWord,
+    /// Emacs `M-f`/`M-b` — Unicode (UAX-29) word segmentation, so e.g. `can't`
+    /// and `3.14` stay single words. The one flavor that isn't a thin char-class
+    /// predicate; see `locate_word`. Holding those together turns on the
+    /// characters flanking a `'` or a `.` rather than on their class, thus it
+    /// stays a separate scan instead of collapsing onto a boundary predicate.
+    Unicode,
+}
+
+/// Which edge of a word a motion lands on.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum WordEdge {
+    /// First character of the word — `w`/`W` (forward), `b`/`B` (backward).
+    Start,
+    /// Last character of the word, inclusive — `e`/`E`.
+    End,
+}
+
+/// Where a character-search motion stops relative to the found character.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum FindStop {
+    /// Land on the found character — vi `f`/`F`.
+    On,
+    /// Land just before it — vi `t`/`T`.
+    Before,
+}
+
+/// Granularity of an operator and of the register it fills: inline characters or
+/// whole lines.
+///
+/// `LineWise` (vi `dd`/`yy`/`V`) operates on complete lines and pastes on a new
+/// line below/above; `CharWise` is the default inline behavior. Carried on the
+/// operator and stored on the cut buffer, so paste knows which to do.
+///
+/// Non-exhaustive: granularities may be added (e.g. block-wise), so external
+/// matches need a wildcard arm.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Granularity {
+    /// Inline at the cursor — the default.
+    #[default]
+    CharWise,
+    /// Whole lines, pasted below/above.
+    LineWise,
+}
+
+/// A human-readable, parameterized motion target — the public vocabulary every
+/// cursor motion lowers from.
+///
+/// `Move`/`Extend`/`Cut`/`Copy`/`Erase` over a `MotionTarget` are the
+/// going-forward motion API. They resolve through the private `resolve_motion`
+/// and apply to the cursor, both free to change. Mode differences (vi vs emacs
+/// vs helix word rules) are carried as *data* here (e.g. [`WordKind`]) rather
+/// than as separate commands.
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum MotionTarget {
+    /// One grapheme in `direction` — `MoveLeft`/`MoveRight`.
+    Grapheme(Direction),
+    /// A word edge — vi `w`/`W`/`e`/`E`/`b`/`B`.
+    Word {
+        /// Small word vs big WORD.
+        kind: WordKind,
+        /// First vs last character of the word.
+        edge: WordEdge,
+        /// Travel direction.
+        direction: Direction,
+    },
+    /// Logical line edge: `Backward` = line start (`0`), `Forward` = line end (`$`).
+    LineEdge(Direction),
+    /// First non-whitespace character on the current line (helix `gs`). A blank
+    /// line has none, so the motion stays put.
+    LineStartNonBlank,
+    /// Whole-buffer edge: `Backward` = start (`gg`), `Forward` = end (`G`).
+    BufferEdge(Direction),
+    /// The adjacent logical line: `Forward` = line below (`j`), `Backward` =
+    /// line above (`k`). Used by the linewise operators (`dj`/`dk`); the head
+    /// lands on the adjacent line so a `LineWise` span covers both lines.
+    Line(Direction),
+    /// Character search — vi `f`/`F`/`t`/`T`.
+    Find {
+        /// The character to search for.
+        ch: char,
+        /// Travel direction.
+        direction: Direction,
+        /// Land on the character vs just before it.
+        stop: FindStop,
+    },
+    /// A byte position, clamped into the buffer — measured from the buffer
+    /// start, not a displacement from the cursor.
+    Position(usize),
+}
+
+impl MotionTarget {
+    /// The `,`-style reverse: flip a [`Find`](MotionTarget::Find)'s direction.
+    ///
+    /// Only `Find` is reversible — every other target passes through unchanged,
+    /// because a reversed word/line edge is a *different* motion, not the same
+    /// motion the other way (e.g. backward word-end is `ge`, not `e` flipped).
+    pub(crate) fn reversed(self) -> Self {
+        match self {
+            MotionTarget::Find {
+                ch,
+                direction,
+                stop,
+            } => MotionTarget::Find {
+                ch,
+                direction: direction.reversed(),
+                stop,
+            },
+            other => other,
+        }
+    }
+
+    /// Which way the motion travels, or `None` for a target that names a
+    /// destination rather than a displacement.
+    pub(crate) fn direction(self) -> Option<Direction> {
+        match self {
+            MotionTarget::Grapheme(direction)
+            | MotionTarget::Word { direction, .. }
+            | MotionTarget::LineEdge(direction)
+            | MotionTarget::BufferEdge(direction)
+            | MotionTarget::Line(direction)
+            | MotionTarget::Find { direction, .. } => Some(direction),
+            // Destination-shaped targets go here. Where they lie depends on the
+            // cursor, so callers resolve first and compare after.
+            MotionTarget::Position(_) => None,
+            MotionTarget::LineStartNonBlank => None,
         }
     }
 }
@@ -84,9 +332,9 @@ impl Default for TextObject {
 ///
 /// Executed by `Reedline::run_edit_commands()`
 #[non_exhaustive]
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, EnumDiscriminants, EnumIter)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, EnumDiscriminants)]
 #[strum_discriminants(doc = "This is the auto generated discriminant type for [`EditCommand`]")]
-#[strum_discriminants(derive(EnumString, VariantArray))]
+#[strum_discriminants(derive(EnumIter, EnumString, VariantArray))]
 #[strum_discriminants(strum(ascii_case_insensitive))]
 pub enum EditCommand {
     /// Move to the start of the buffer
@@ -193,17 +441,91 @@ pub enum EditCommand {
         select: bool,
     },
 
+    /// Move the cursor to a [`MotionTarget`], collapsing any selection.
+    ///
+    /// The parameterized, human-readable face of the selection primitive.
+    /// `Move`/`Extend`/`Cut`/`Copy`/`Change`/`Erase` over a [`MotionTarget`] are
+    /// the going-forward motion API; the older `MoveWord*`/`CutWord*` variants
+    /// are kept as sugar over them.
+    Move(MotionTarget),
+
+    /// Extend the selection to a [`MotionTarget`]: move the cursor head to the
+    /// target while keeping the anchor fixed.
+    Extend(MotionTarget),
+
+    /// Cut the text between the cursor and a [`MotionTarget`] into the cut buffer.
+    /// `granularity` decides whether the span is taken char-wise or snapped to
+    /// whole lines (and tags the register accordingly).
+    Cut {
+        /// Where the operator reaches to.
+        target: MotionTarget,
+        /// Char-wise span or whole lines.
+        granularity: Granularity,
+    },
+
+    /// Copy the text between the cursor and a [`MotionTarget`] into the cut
+    /// buffer, leaving the buffer and cursor unchanged.
+    Copy {
+        /// Where the operator reaches to.
+        target: MotionTarget,
+        /// Char-wise span or whole lines.
+        granularity: Granularity,
+    },
+
+    /// Select up to a [`MotionTarget`]: drop a fresh anchor at the caret, then
+    /// move the head to the target, so the selection covers the span just traveled.
+    Select(MotionTarget),
+
+    /// Select a [`TextObject`]
+    SelectTextObject(TextObject),
+
+    /// Cut like [`EditCommand::Cut`], except that a `LineWise` span keeps its
+    /// line terminators: only the lines' *content* is consumed, so one blank
+    /// line remains — the vi change operator's linewise semantics
+    /// (`cc`/`cj`/`cgg`), which re-enter insert mode on that blank line.
+    /// Identical to `Cut` for `CharWise` spans.
+    Change {
+        /// Where the operator reaches to.
+        target: MotionTarget,
+        /// Char-wise span or whole lines.
+        granularity: Granularity,
+    },
+
+    /// Erase the text between the cursor and a [`MotionTarget`] without touching
+    /// the cut buffer (no-register counterpart of [`EditCommand::Cut`]).
+    Erase(MotionTarget),
+
     /// Insert a character at the current insertion point
     InsertChar(char),
 
     /// Insert a string at the current insertion point
     InsertString(String),
 
+    /// Insert a character pair around the selection or insertion point
+    InsertPair {
+        /// Opening character of the pair
+        open: char,
+        /// Closing character of the pair
+        close: char,
+    },
+
     /// Inserts the system specific new line character
     ///
     /// - On Unix systems LF (`"\n"`)
     /// - On Windows CRLF (`"\r\n"`)
     InsertNewline,
+
+    /// Inserts a new line above the current line
+    ///
+    /// - On Unix systems LF (`"\n"`)
+    /// - On Windows CRLF (`"\r\n"`)
+    InsertNewlineAbove,
+
+    /// Inserts a new line below the current line
+    ///
+    /// - On Unix systems LF (`"\n"`)
+    /// - On Windows CRLF (`"\r\n"`)
+    InsertNewlineBelow,
 
     /// Replace a character
     ReplaceChar(char),
@@ -214,8 +536,19 @@ pub enum EditCommand {
     /// Backspace delete from the current insertion point
     Backspace,
 
+    /// Backspace delete an empty character pair
+    BackspacePair {
+        /// Opening character of the pair
+        open: char,
+        /// Closing character of the pair
+        close: char,
+    },
+
     /// Delete in-place from the current insertion point
     Delete,
+
+    /// Cut the grapheme left from the current insertion point
+    CutCharLeft,
 
     /// Cut the grapheme right from the current insertion point
     CutChar,
@@ -236,12 +569,20 @@ pub enum EditCommand {
     Complete,
 
     /// Cut the current line
+    ///
+    /// Legacy — prefer [`EditCommand::Cut`] with
+    /// [`MotionTarget::LineEdge`]`(Forward)` and [`Granularity::LineWise`],
+    /// which all builtin bindings lower through.
     CutCurrentLine,
 
     /// Cut from the start of the buffer to the insertion point
     CutFromStart,
 
     /// Cut from the start of the buffer to the line of insertion point
+    ///
+    /// Legacy — prefer [`EditCommand::Cut`] / [`EditCommand::Change`] (for
+    /// `leave_blank_line: true`) with [`MotionTarget::BufferEdge`]`(Backward)`
+    /// and [`Granularity::LineWise`], which all builtin bindings lower through.
     CutFromStartLinewise {
         /// When true, an empty line will remain after the operation
         leave_blank_line: bool,
@@ -257,6 +598,10 @@ pub enum EditCommand {
     CutToEnd,
 
     /// Cut from the line of insertion point to the end of the buffer
+    ///
+    /// Legacy — prefer [`EditCommand::Cut`] / [`EditCommand::Change`] (for
+    /// `leave_blank_line: true`) with [`MotionTarget::BufferEdge`]`(Forward)`
+    /// and [`Granularity::LineWise`], which all builtin bindings lower through.
     CutToEndLinewise {
         /// When true, an empty line will remain after the operation
         leave_blank_line: bool,
@@ -290,14 +635,51 @@ pub enum EditCommand {
     /// Paste the cut buffer in front of the insertion point (Emacs, vi `P`)
     PasteCutBufferBefore,
 
-    /// Paste the cut buffer in front of the insertion point (vi `p`)
+    /// Paste the cut buffer after the insertion point (vi `p`)
     PasteCutBufferAfter,
+
+    /// Paste the cut buffer at the selection edge in the given `direction` and
+    /// select the pasted text (helix `p`/`P`). Selecting the result means the
+    /// command cannot simply be issued twice for a count, so it carries `count`
+    /// explicitly.
+    PasteAtSelectionEdge {
+        /// Whether to paste on the forward or backward edge of the selection
+        direction: Direction,
+        /// Number of times the cut buffer content is placed
+        count: usize,
+    },
+
+    /// Insert the kill ring's current slot at the caret — GNU `rl_yank`
+    /// (kill.c:509-525), bound to `C-y` in the emacs keymap
+    /// (emacs_keymap.c). The pre-insert caret is where GNU drops the mark
+    /// (`_rl_set_mark_at_pos`); the inserted text is what a following
+    /// [`YankPop`](EditCommand::YankPop) rewrites.
+    Yank,
+
+    /// Cycle the just-yanked text back to the next-older kill-ring slot —
+    /// GNU `rl_yank_pop` (`M-y`, kill.c:527-556). Applicable only directly
+    /// after [`Yank`](EditCommand::Yank) or another `YankPop`
+    /// (`rl_last_func`), and only while the last yanked text still
+    /// literally precedes the caret (`STREQN`); any intervening command
+    /// makes it inapplicable.
+    YankPop,
+
+    /// Kill one filename component backward into the kill ring — GNU
+    /// `rl_unix_filename_rubout` (kill.c:338-397): back over whitespace,
+    /// then a `/` run, then a non-`/` non-whitespace component. GNU leaves
+    /// it unbound in the emacs keymap; it is exposed here for custom
+    /// bindings.
+    CutFilenameLeft,
 
     /// Upper case the current word
     UppercaseWord,
 
     /// Lower case the current word
     LowercaseWord,
+
+    /// Capitalize the current word: upper case its first character and
+    /// leave the rest untouched (GNU readline `capitalize-word`, M-c)
+    CapitalizeWord,
 
     /// Capitalize the current character
     CapitalizeChar,
@@ -308,6 +690,10 @@ pub enum EditCommand {
     /// Swap the current word with the word to the right
     SwapWords,
 
+    /// Deletes all whitespace around the insertion point (readline
+    /// `delete-horizontal-space`, `M-\`).
+    DeleteHorizontalSpace,
+
     /// Swap the current grapheme/character with the one to the right
     SwapGraphemes,
 
@@ -316,6 +702,21 @@ pub enum EditCommand {
 
     /// Redo an edit command from the undo history
     Redo,
+
+    /// Undo every change to the current line in one step — GNU readline
+    /// `revert-line` (undo.c:331 `rl_revert_line`, bound to `M-r` and
+    /// `M-C-r` in the emacs map). Reports inapplicable when the undo
+    /// stack is empty, matching GNU's `rl_ding` on an empty
+    /// `rl_undo_list`.
+    ///
+    /// Caveat vs GNU: the revert target is the bottom of reedline's
+    /// undo stack — the buffer as it was when this line's editing
+    /// began. GNU instead restores the current history entry's saved
+    /// original (`entry->data`); since reedline's undo coalesces
+    /// history navigation into one entry per hop, a recalled-then-edited
+    /// entry reverts to the live line as it was before traversal, not
+    /// to the entry's text.
+    RevertLine,
 
     /// CutUntil right until char
     CutRightUntil(char),
@@ -364,11 +765,39 @@ pub enum EditCommand {
     /// Select whole input buffer
     SelectAll,
 
+    /// Snap the selection out to the whole lines it touches (helix `x`), or take
+    /// one more line when it already spans them exactly.
+    ///
+    /// Repeating therefore grows it a line at a time, so a count is the command
+    /// applied that many times.
+    SelectLine,
+
+    /// Delete the selection without filling the cut buffer (helix `Alt-d`).
+    ///
+    /// [`CutSelection`](EditCommand::CutSelection) clobbers the register, which
+    /// is exactly what this avoids when the text is not wanted back.
+    EraseSelection,
+
     /// Cut selection to local buffer
-    CutSelection,
+    CutSelection {
+        /// Char-wise span or whole lines.
+        granularity: Granularity,
+    },
+
+    /// Collapse the selection (or a block cursor's width) to a caret at one of its edges
+    CollapseSelection(Direction),
 
     /// Copy selection to local buffer
     CopySelection,
+
+    /// LowercaseSelection
+    LowercaseSelection,
+
+    /// Uppercase selection
+    UppercaseSelection,
+
+    /// Switchcase selection
+    SwitchcaseSelection,
 
     /// Paste content from local buffer at the current cursor position
     Paste,
@@ -377,6 +806,9 @@ pub enum EditCommand {
     CopyFromStart,
 
     /// Copy from the start of the buffer to the line of insertion point
+    ///
+    /// Legacy — prefer [`EditCommand::Copy`] with
+    /// [`MotionTarget::BufferEdge`]`(Backward)` and [`Granularity::LineWise`].
     CopyFromStartLinewise,
 
     /// Copy from the start of the current line to the insertion point
@@ -389,6 +821,9 @@ pub enum EditCommand {
     CopyToEnd,
 
     /// Copy from the line of insertion point to the end of the buffer
+    ///
+    /// Legacy — prefer [`EditCommand::Copy`] with
+    /// [`MotionTarget::BufferEdge`]`(Forward)` and [`Granularity::LineWise`].
     CopyToEndLinewise,
 
     /// Copy from the insertion point to the end of the current line
@@ -447,179 +882,34 @@ pub enum EditCommand {
     #[cfg(feature = "system_clipboard")]
     PasteSystem,
 
-    /// Delete text between matching characters atomically
-    CutInsidePair {
-        /// Left character of the pair
-        left: char,
-        /// Right character of the pair (usually matching bracket)
-        right: char,
-    },
-    /// Yank text between matching characters atomically
-    CopyInsidePair {
-        /// Left character of the pair
-        left: char,
-        /// Right character of the pair (usually matching bracket)
-        right: char,
-    },
-    /// Delete text around matching characters atomically (including the pair characters)
-    CutAroundPair {
-        /// Left character of the pair
-        left: char,
-        /// Right character of the pair (usually matching bracket)
-        right: char,
-    },
-    /// Yank text around matching characters atomically (including the pair characters)
-    CopyAroundPair {
-        /// Left character of the pair
-        left: char,
-        /// Right character of the pair (usually matching bracket)
-        right: char,
-    },
     /// Cut the specified text object
     CutTextObject {
         /// The text object to operate on
         text_object: TextObject,
     },
+
     /// Copy the specified text object
     CopyTextObject {
         /// The text object to operate on
         text_object: TextObject,
     },
-}
-
-impl Display for EditCommand {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        match self {
-            EditCommand::MoveToStart { .. } => write!(f, "MoveToStart Optional[select: <bool>]"),
-            EditCommand::MoveToLineStart { .. } => {
-                write!(f, "MoveToLineStart Optional[select: <bool>]")
-            }
-            EditCommand::MoveToLineNonBlankStart { .. } => {
-                write!(f, "MoveToLineNonBlankStart Optional[select: <bool>]")
-            }
-            EditCommand::MoveToEnd { .. } => write!(f, "MoveToEnd Optional[select: <bool>]"),
-            EditCommand::MoveToLineEnd { .. } => {
-                write!(f, "MoveToLineEnd Optional[select: <bool>]")
-            }
-            EditCommand::MoveLineUp { .. } => write!(f, "MoveLineUp Optional[select: <bool>]"),
-            EditCommand::MoveLineDown { .. } => write!(f, "MoveLineDown Optional[select: <bool>]"),
-            EditCommand::MoveLeft { .. } => write!(f, "MoveLeft Optional[select: <bool>]"),
-            EditCommand::MoveRight { .. } => write!(f, "MoveRight Optional[select: <bool>]"),
-            EditCommand::MoveWordLeft { .. } => write!(f, "MoveWordLeft Optional[select: <bool>]"),
-            EditCommand::MoveBigWordLeft { .. } => {
-                write!(f, "MoveBigWordLeft Optional[select: <bool>]")
-            }
-            EditCommand::MoveWordRight { .. } => {
-                write!(f, "MoveWordRight Optional[select: <bool>]")
-            }
-            EditCommand::MoveWordRightEnd { .. } => {
-                write!(f, "MoveWordRightEnd Optional[select: <bool>]")
-            }
-            EditCommand::MoveBigWordRightEnd { .. } => {
-                write!(f, "MoveBigWordRightEnd Optional[select: <bool>]")
-            }
-            EditCommand::MoveWordRightStart { .. } => {
-                write!(f, "MoveWordRightStart Optional[select: <bool>]")
-            }
-            EditCommand::MoveBigWordRightStart { .. } => {
-                write!(f, "MoveBigWordRightStart Optional[select: <bool>]")
-            }
-            EditCommand::MoveToPosition { .. } => {
-                write!(f, "MoveToPosition  Value: <int>, Optional[select: <bool>]")
-            }
-            EditCommand::MoveLeftUntil { .. } => {
-                write!(f, "MoveLeftUntil Value: <char>, Optional[select: <bool>]")
-            }
-            EditCommand::MoveLeftBefore { .. } => {
-                write!(f, "MoveLeftBefore Value: <char>, Optional[select: <bool>]")
-            }
-            EditCommand::InsertChar(_) => write!(f, "InsertChar  Value: <char>"),
-            EditCommand::InsertString(_) => write!(f, "InsertString Value: <string>"),
-            EditCommand::InsertNewline => write!(f, "InsertNewline"),
-            EditCommand::ReplaceChar(_) => write!(f, "ReplaceChar <char>"),
-            EditCommand::ReplaceChars(_, _) => write!(f, "ReplaceChars <int> <string>"),
-            EditCommand::Backspace => write!(f, "Backspace"),
-            EditCommand::Delete => write!(f, "Delete"),
-            EditCommand::CutChar => write!(f, "CutChar"),
-            EditCommand::BackspaceWord => write!(f, "BackspaceWord"),
-            EditCommand::DeleteWord => write!(f, "DeleteWord"),
-            EditCommand::Clear => write!(f, "Clear"),
-            EditCommand::ClearToLineEnd => write!(f, "ClearToLineEnd"),
-            EditCommand::Complete => write!(f, "Complete"),
-            EditCommand::CutCurrentLine => write!(f, "CutCurrentLine"),
-            EditCommand::CutFromStart => write!(f, "CutFromStart"),
-            EditCommand::CutFromStartLinewise { .. } => {
-                write!(f, "CutFromStartLinewise Value: <bool>")
-            }
-            EditCommand::CutFromLineStart => write!(f, "CutFromLineStart"),
-            EditCommand::CutFromLineNonBlankStart => write!(f, "CutFromLineNonBlankStart"),
-            EditCommand::CutToEnd => write!(f, "CutToEnd"),
-            EditCommand::CutToEndLinewise { .. } => {
-                write!(f, "CutToEndLinewise Value: <bool>")
-            }
-            EditCommand::CutToLineEnd => write!(f, "CutToLineEnd"),
-            EditCommand::KillLine => write!(f, "KillLine"),
-            EditCommand::CutWordLeft => write!(f, "CutWordLeft"),
-            EditCommand::CutBigWordLeft => write!(f, "CutBigWordLeft"),
-            EditCommand::CutWordRight => write!(f, "CutWordRight"),
-            EditCommand::CutBigWordRight => write!(f, "CutBigWordRight"),
-            EditCommand::CutWordRightToNext => write!(f, "CutWordRightToNext"),
-            EditCommand::CutBigWordRightToNext => write!(f, "CutBigWordRightToNext"),
-            EditCommand::PasteCutBufferBefore => write!(f, "PasteCutBufferBefore"),
-            EditCommand::PasteCutBufferAfter => write!(f, "PasteCutBufferAfter"),
-            EditCommand::UppercaseWord => write!(f, "UppercaseWord"),
-            EditCommand::LowercaseWord => write!(f, "LowercaseWord"),
-            EditCommand::SwitchcaseChar => write!(f, "SwitchcaseChar"),
-            EditCommand::CapitalizeChar => write!(f, "CapitalizeChar"),
-            EditCommand::SwapWords => write!(f, "SwapWords"),
-            EditCommand::SwapGraphemes => write!(f, "SwapGraphemes"),
-            EditCommand::Undo => write!(f, "Undo"),
-            EditCommand::Redo => write!(f, "Redo"),
-            EditCommand::CutRightUntil(_) => write!(f, "CutRightUntil Value: <char>"),
-            EditCommand::CutRightBefore(_) => write!(f, "CutRightBefore Value: <char>"),
-            EditCommand::MoveRightUntil { .. } => write!(f, "MoveRightUntil Value: <char>"),
-            EditCommand::MoveRightBefore { .. } => write!(f, "MoveRightBefore Value: <char>"),
-            EditCommand::CutLeftUntil(_) => write!(f, "CutLeftUntil Value: <char>"),
-            EditCommand::CutLeftBefore(_) => write!(f, "CutLeftBefore Value: <char>"),
-            EditCommand::SelectAll => write!(f, "SelectAll"),
-            EditCommand::CutSelection => write!(f, "CutSelection"),
-            EditCommand::CopySelection => write!(f, "CopySelection"),
-            EditCommand::Paste => write!(f, "Paste"),
-            EditCommand::CopyFromStart => write!(f, "CopyFromStart"),
-            EditCommand::CopyFromStartLinewise => write!(f, "CopyFromStartLinewise"),
-            EditCommand::CopyFromLineStart => write!(f, "CopyFromLineStart"),
-            EditCommand::CopyFromLineNonBlankStart => write!(f, "CopyFromLineNonBlankStart"),
-            EditCommand::CopyToEnd => write!(f, "CopyToEnd"),
-            EditCommand::CopyToEndLinewise => write!(f, "CopyToEndLinewise"),
-            EditCommand::CopyToLineEnd => write!(f, "CopyToLineEnd"),
-            EditCommand::CopyCurrentLine => write!(f, "CopyCurrentLine"),
-            EditCommand::CopyWordLeft => write!(f, "CopyWordLeft"),
-            EditCommand::CopyBigWordLeft => write!(f, "CopyBigWordLeft"),
-            EditCommand::CopyWordRight => write!(f, "CopyWordRight"),
-            EditCommand::CopyBigWordRight => write!(f, "CopyBigWordRight"),
-            EditCommand::CopyWordRightToNext => write!(f, "CopyWordRightToNext"),
-            EditCommand::CopyBigWordRightToNext => write!(f, "CopyBigWordRightToNext"),
-            EditCommand::CopyLeft => write!(f, "CopyLeft"),
-            EditCommand::CopyRight => write!(f, "CopyRight"),
-            EditCommand::CopyRightUntil(_) => write!(f, "CopyRightUntil Value: <char>"),
-            EditCommand::CopyRightBefore(_) => write!(f, "CopyRightBefore Value: <char>"),
-            EditCommand::CopyLeftUntil(_) => write!(f, "CopyLeftUntil Value: <char>"),
-            EditCommand::CopyLeftBefore(_) => write!(f, "CopyLeftBefore Value: <char>"),
-            EditCommand::SwapCursorAndAnchor => write!(f, "SwapCursorAndAnchor"),
-            #[cfg(feature = "system_clipboard")]
-            EditCommand::CutSelectionSystem => write!(f, "CutSelectionSystem"),
-            #[cfg(feature = "system_clipboard")]
-            EditCommand::CopySelectionSystem => write!(f, "CopySelectionSystem"),
-            #[cfg(feature = "system_clipboard")]
-            EditCommand::PasteSystem => write!(f, "PasteSystem"),
-            EditCommand::CutInsidePair { .. } => write!(f, "CutInsidePair Value: <char> <char>"),
-            EditCommand::CopyInsidePair { .. } => write!(f, "CopyInsidePair Value: <char> <char>"),
-            EditCommand::CutAroundPair { .. } => write!(f, "CutAroundPair Value: <char> <char>"),
-            EditCommand::CopyAroundPair { .. } => write!(f, "CopyAroundPair Value: <char> <char>"),
-            EditCommand::CutTextObject { .. } => write!(f, "CutTextObject Value: <TextObject>"),
-            EditCommand::CopyTextObject { .. } => write!(f, "CopyTextObject Value: <TextObject>"),
-        }
-    }
+    /// Add the specified text object around the selection
+    AddTextObject {
+        /// The text object to operate on
+        text_object: TextObjectType,
+    },
+    /// Remove the nearest specified text object around the cursor head
+    RemoveTextObject {
+        /// The text object to operate on
+        text_object: TextObjectType,
+    },
+    /// Replace the nearest specified text object around the cursor head
+    ReplaceTextObject {
+        /// The old text object to replace
+        old: TextObjectType,
+        /// The new text object to replace with
+        new: TextObjectType,
+    },
 }
 
 impl EditCommand {
@@ -654,17 +944,25 @@ impl EditCommand {
             EditCommand::SwapCursorAndAnchor => EditType::MoveCursor { select: true },
 
             EditCommand::SelectAll => EditType::MoveCursor { select: true },
+            EditCommand::EraseSelection => EditType::EditText,
+            EditCommand::SelectLine => EditType::MoveCursor { select: true },
             // Text edits
             EditCommand::InsertChar(_)
             | EditCommand::Backspace
+            | EditCommand::BackspacePair { .. }
             | EditCommand::Delete
             | EditCommand::CutChar
+            | EditCommand::CutCharLeft
             | EditCommand::InsertString(_)
+            | EditCommand::InsertPair { .. }
             | EditCommand::InsertNewline
+            | EditCommand::InsertNewlineAbove
+            | EditCommand::InsertNewlineBelow
             | EditCommand::ReplaceChar(_)
             | EditCommand::ReplaceChars(_, _)
             | EditCommand::BackspaceWord
             | EditCommand::DeleteWord
+            | EditCommand::DeleteHorizontalSpace
             | EditCommand::Clear
             | EditCommand::ClearToLineEnd
             | EditCommand::Complete
@@ -685,8 +983,12 @@ impl EditCommand {
             | EditCommand::CutBigWordRightToNext
             | EditCommand::PasteCutBufferBefore
             | EditCommand::PasteCutBufferAfter
+            | EditCommand::Yank
+            | EditCommand::YankPop
+            | EditCommand::CutFilenameLeft
             | EditCommand::UppercaseWord
             | EditCommand::LowercaseWord
+            | EditCommand::CapitalizeWord
             | EditCommand::SwitchcaseChar
             | EditCommand::CapitalizeChar
             | EditCommand::SwapWords
@@ -695,16 +997,18 @@ impl EditCommand {
             | EditCommand::CutRightBefore(_)
             | EditCommand::CutLeftUntil(_)
             | EditCommand::CutLeftBefore(_)
-            | EditCommand::CutSelection
+            | EditCommand::CutSelection { .. }
+            | EditCommand::LowercaseSelection
+            | EditCommand::UppercaseSelection
+            | EditCommand::SwitchcaseSelection
             | EditCommand::Paste
-            | EditCommand::CutInsidePair { .. }
-            | EditCommand::CutAroundPair { .. }
-            | EditCommand::CutTextObject { .. } => EditType::EditText,
+            | EditCommand::CutTextObject { .. }
+            | EditCommand::PasteAtSelectionEdge { .. } => EditType::EditText,
 
             #[cfg(feature = "system_clipboard")] // Sadly cfg attributes in patterns don't work
             EditCommand::CutSelectionSystem | EditCommand::PasteSystem => EditType::EditText,
 
-            EditCommand::Undo | EditCommand::Redo => EditType::UndoRedo,
+            EditCommand::Undo | EditCommand::Redo | EditCommand::RevertLine => EditType::UndoRedo,
 
             EditCommand::CopySelection => EditType::NoOp,
             #[cfg(feature = "system_clipboard")]
@@ -729,9 +1033,98 @@ impl EditCommand {
             | EditCommand::CopyRightBefore(_)
             | EditCommand::CopyLeftUntil(_)
             | EditCommand::CopyLeftBefore(_)
-            | EditCommand::CopyInsidePair { .. }
-            | EditCommand::CopyAroundPair { .. }
             | EditCommand::CopyTextObject { .. } => EditType::NoOp,
+
+            EditCommand::AddTextObject { .. }
+            | EditCommand::RemoveTextObject { .. }
+            | EditCommand::ReplaceTextObject { .. } => EditType::EditText,
+
+            // The six MotionTarget verbs. `Move`/`Extend` carry the old `select`
+            // bool in the verb itself (Extend must be `select: true` so the editor
+            // does not clear the selection it is extending). `Cut`/`Change`/`Erase`
+            // mutate the buffer; `Copy` does not.
+            EditCommand::Move(_) => EditType::MoveCursor { select: false },
+            EditCommand::Extend(_) => EditType::MoveCursor { select: true },
+            EditCommand::CollapseSelection(_) => EditType::MoveCursor { select: false },
+            EditCommand::Select(_) | EditCommand::SelectTextObject(_) => {
+                EditType::MoveCursor { select: true }
+            }
+            EditCommand::Cut { .. } => EditType::EditText,
+            EditCommand::Copy { .. } => EditType::NoOp,
+            EditCommand::Change { .. } => EditType::EditText,
+            EditCommand::Erase(_) => EditType::EditText,
+        }
+    }
+
+    /// Whether executing this command can feed the kill ring — the
+    /// `_rl_last_command_was_kill` bookkeeping of readline.c's charloop
+    /// (readline.c:588,711-716): only a kill-class command re-arms the flag
+    /// that lets the *next* kill merge into the newest slot
+    /// (`_rl_copy_to_kill_ring`, kill.c:90); every other command clears it.
+    /// Both cuts and copies count, as in GNU (`region_kill_internal`
+    /// bumps the flag for `copy-region-as-kill` too, kill.c:445-449), and
+    /// an attempted kill that moves no text still counts (kill.c:150-153).
+    ///
+    /// Pastes, [`Yank`](EditCommand::Yank) and
+    /// [`YankPop`](EditCommand::YankPop) read the ring without feeding it,
+    /// so they break a merge chain just like GNU's non-kill commands do.
+    pub(crate) fn feeds_kill_ring(&self) -> bool {
+        match self {
+            EditCommand::Cut { .. }
+            | EditCommand::Change { .. }
+            | EditCommand::CutChar
+            | EditCommand::CutCharLeft
+            | EditCommand::BackspaceWord
+            | EditCommand::CutCurrentLine
+            | EditCommand::CutFromStart
+            | EditCommand::CutFromStartLinewise { .. }
+            | EditCommand::CutFromLineStart
+            | EditCommand::CutFromLineNonBlankStart
+            | EditCommand::CutToEnd
+            | EditCommand::CutToEndLinewise { .. }
+            | EditCommand::CutToLineEnd
+            | EditCommand::KillLine
+            | EditCommand::CutWordLeft
+            | EditCommand::CutBigWordLeft
+            | EditCommand::CutWordRight
+            | EditCommand::CutBigWordRight
+            | EditCommand::CutWordRightToNext
+            | EditCommand::CutBigWordRightToNext
+            | EditCommand::CutRightUntil(_)
+            | EditCommand::CutRightBefore(_)
+            | EditCommand::CutLeftUntil(_)
+            | EditCommand::CutLeftBefore(_)
+            | EditCommand::CutSelection { .. }
+            | EditCommand::CutTextObject { .. }
+            | EditCommand::CutFilenameLeft
+            | EditCommand::Copy { .. }
+            | EditCommand::CopySelection
+            | EditCommand::CopyFromStart
+            | EditCommand::CopyFromStartLinewise
+            | EditCommand::CopyFromLineStart
+            | EditCommand::CopyFromLineNonBlankStart
+            | EditCommand::CopyToEnd
+            | EditCommand::CopyToEndLinewise
+            | EditCommand::CopyToLineEnd
+            | EditCommand::CopyCurrentLine
+            | EditCommand::CopyWordLeft
+            | EditCommand::CopyBigWordLeft
+            | EditCommand::CopyWordRight
+            | EditCommand::CopyBigWordRight
+            | EditCommand::CopyWordRightToNext
+            | EditCommand::CopyBigWordRightToNext
+            | EditCommand::CopyLeft
+            | EditCommand::CopyRight
+            | EditCommand::CopyRightUntil(_)
+            | EditCommand::CopyRightBefore(_)
+            | EditCommand::CopyLeftUntil(_)
+            | EditCommand::CopyLeftBefore(_)
+            | EditCommand::CopyTextObject { .. } => true,
+            // The system-clipboard cut still feeds the local ring through
+            // `cut_range`; the system copy does not.
+            #[cfg(feature = "system_clipboard")]
+            EditCommand::CutSelectionSystem => true,
+            _ => false,
         }
     }
 }
@@ -804,9 +1197,9 @@ impl UndoBehavior {
 }
 
 /// Reedline supported actions.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, EnumDiscriminants, EnumIter)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, EnumDiscriminants)]
 #[strum_discriminants(doc = "This is the auto generated discriminant type for [`ReedlineEvent`]")]
-#[strum_discriminants(derive(EnumString, VariantArray))]
+#[strum_discriminants(derive(EnumIter, EnumString, VariantArray))]
 #[strum_discriminants(strum(ascii_case_insensitive))]
 pub enum ReedlineEvent {
     /// No op event
@@ -878,6 +1271,12 @@ pub enum ReedlineEvent {
 
     /// Navigate to the previous historic buffer
     PreviousHistory,
+    /// Jump to the oldest entry in the history (GNU readline
+    /// `beginning-of-history`, PgUp in its default map).
+    FirstHistoryEntry,
+    /// Jump to the newest entry in the history (GNU readline
+    /// `end-of-history`, PgDn in its default map).
+    LastHistoryEntry,
 
     /// Move up to the previous line, if multiline, or up into the historic buffers
     Up,
@@ -913,6 +1312,15 @@ pub enum ReedlineEvent {
     /// Trigger a menu event. It activates a menu with the event name
     Menu(String),
 
+    /// Accept the highlighted menu item without submitting the line.
+    ///
+    /// Splices the selection into the buffer and closes the menu, as `Enter` does while
+    /// a menu is open, but stops there. Inapplicable when no menu is active or the
+    /// active one has nothing to accept, so it composes: `UntilFound` falls through to
+    /// the next event, and `Multiple` can follow it with an edit, e.g. a space that
+    /// accepts the completion and keeps typing.
+    MenuAccept,
+
     /// Next element in the menu
     MenuNext,
 
@@ -937,72 +1345,251 @@ pub enum ReedlineEvent {
     /// Move to the previous history page
     MenuPagePrevious,
 
-    /// Way to bind the execution of a whole command (directly returning from [`crate::Reedline::read_line()`]) to a keybinding
+    /// Triggers an immediate return from [`Reedline::read_line()`](crate::Reedline::read_line) with an opaque payload.
+    ///
+    /// Reedline does not inspect or validate the contents of this string. It is
+    /// passed directly through to the caller as a [`Signal::HostCommand`].
+    /// Use this to send custom instructions or serialized data from a keybinding
+    /// logic back to the main application loop.
     ExecuteHostCommand(String),
 
     /// Open text editor
     OpenEditor,
 
-    /// Change mode (vi mode only)
-    ViChangeMode(String),
-}
+    /// Switch the line editor to the named edit mode.
+    ///
+    /// The target names both the machine and the state to land in, so
+    /// `SwitchMode(PromptEditMode::Helix(PromptHelixMode::Normal))` reaches
+    /// helix normal from anywhere: from another helix state, from vi, or from
+    /// emacs. The engine offers the target to the active machine first and
+    /// then to every machine registered with
+    /// [`Reedline::with_additional_edit_mode`](crate::Reedline::with_additional_edit_mode);
+    /// the first to accept it becomes active. A host-defined machine is reached
+    /// through the name it reports as [`PromptEditMode::Custom`].
+    ///
+    /// A target no machine accepts leaves everything alone and reports the
+    /// event inapplicable. On its own that is a keybinding that does nothing;
+    /// inside an [`UntilFound`](ReedlineEvent::UntilFound) it hands the key to
+    /// the next event in the list instead. A target naming the mode already
+    /// active is declined the same way, so a binding built as
+    /// `UntilFound([SwitchMode(A), SwitchMode(B)])` toggles between the two.
+    SwitchMode(PromptEditMode),
 
-impl Display for ReedlineEvent {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        match self {
-            ReedlineEvent::None => write!(f, "None"),
-            ReedlineEvent::HistoryHintComplete => write!(f, "HistoryHintComplete"),
-            ReedlineEvent::HistoryHintWordComplete => write!(f, "HistoryHintWordComplete"),
-            ReedlineEvent::CtrlD => write!(f, "CtrlD"),
-            ReedlineEvent::CtrlC => write!(f, "CtrlC"),
-            ReedlineEvent::ClearScreen => write!(f, "ClearScreen"),
-            ReedlineEvent::ClearScrollback => write!(f, "ClearScrollback"),
-            ReedlineEvent::Enter => write!(f, "Enter"),
-            ReedlineEvent::Submit => write!(f, "Submit"),
-            ReedlineEvent::SubmitOrNewline => write!(f, "SubmitOrNewline"),
-            ReedlineEvent::Esc => write!(f, "Esc"),
-            ReedlineEvent::Mouse {
-                column,
-                row,
-                button,
-            } => write!(f, "Mouse({}, {}, {:?})", column, row, button),
-            ReedlineEvent::Resize(_, _) => write!(f, "Resize <int> <int>"),
-            ReedlineEvent::Edit(_) => write!(
-                f,
-                "Edit: <EditCommand> or Edit: <EditCommand> value: <string>"
-            ),
-            ReedlineEvent::Repaint => write!(f, "Repaint"),
-            ReedlineEvent::PreviousHistory => write!(f, "PreviousHistory"),
-            ReedlineEvent::Up => write!(f, "Up"),
-            ReedlineEvent::Down => write!(f, "Down"),
-            ReedlineEvent::ToStart => write!(f, "ToStart"),
-            ReedlineEvent::ToEnd => write!(f, "ToEnd"),
-            ReedlineEvent::Right => write!(f, "Right"),
-            ReedlineEvent::Left => write!(f, "Left"),
-            ReedlineEvent::NextHistory => write!(f, "NextHistory"),
-            ReedlineEvent::SearchHistory => write!(f, "SearchHistory"),
-            ReedlineEvent::Multiple(_) => write!(f, "Multiple[ {{ ReedLineEvents, }} ]"),
-            ReedlineEvent::UntilFound(_) => write!(f, "UntilFound [ {{ ReedLineEvents, }} ]"),
-            ReedlineEvent::Menu(_) => write!(f, "Menu Name: <string>"),
-            ReedlineEvent::MenuNext => write!(f, "MenuNext"),
-            ReedlineEvent::MenuPrevious => write!(f, "MenuPrevious"),
-            ReedlineEvent::MenuUp => write!(f, "MenuUp"),
-            ReedlineEvent::MenuDown => write!(f, "MenuDown"),
-            ReedlineEvent::MenuLeft => write!(f, "MenuLeft"),
-            ReedlineEvent::MenuRight => write!(f, "MenuRight"),
-            ReedlineEvent::MenuPageNext => write!(f, "MenuPageNext"),
-            ReedlineEvent::MenuPagePrevious => write!(f, "MenuPagePrevious"),
-            ReedlineEvent::ExecuteHostCommand(_) => write!(f, "ExecuteHostCommand"),
-            ReedlineEvent::OpenEditor => write!(f, "OpenEditor"),
-            ReedlineEvent::ViChangeMode(_) => write!(f, "ViChangeMode mode: <string>"),
-        }
-    }
+    /// Replays a sequence of keys as if the user had typed them.
+    ///
+    /// This is the mechanism GNU readline's `bind '"key": "macro"'` needs:
+    /// a macro's payload is not text to insert but a byte stream of
+    /// keystrokes, each dispatched through the keymap when it is
+    /// *consumed* — not when the sequence was registered. A replayed key
+    /// may therefore fire any binding, including another `KeySequence`;
+    /// literal characters belong in the stream as
+    /// `(KeyModifiers::NONE, KeyCode::Char(c))` and reach the buffer
+    /// through the ordinary self-insert path, which also makes the same
+    /// sequence do the right thing under vi-mode maps where letters are
+    /// bound to motions.
+    ///
+    /// Replayed keys are queued ahead of live terminal input and consumed
+    /// at the start of the next input batch — so inside a [`Multiple`], a
+    /// `KeySequence` enqueues while the remaining events still run first.
+    /// The queue is bounded ([`crate::Reedline::MAX_REPLAYED_KEYS`]); a
+    /// self-retriggering sequence is truncated once the cap is reached.
+    KeySequence(Vec<crate::edit_mode::KeyCombination>),
+
+    /// Inserts the next key literally, bypassing its binding
+    /// (readline `quoted-insert`, `C-v`/`C-q`).
+    ///
+    /// The key after this event is consumed as data, not dispatched:
+    /// a character inserts itself (control-modified characters insert
+    /// their control byte), `Enter` inserts `\r`, `Tab` inserts `\t`,
+    /// and non-character keys are consumed with no insert — matching
+    /// GNU's `rl_quoted_insert`, which reads one input character
+    /// verbatim.
+    QuotedInsert,
+
+    /// Read one key, then move the cursor to that character's next
+    /// occurrence in `direction` — GNU readline `character-search`
+    /// (`C-]`, text.c:1829 `rl_char_search` / `rl_backward_char_search`,
+    /// `M-C-]`). GNU's `FFIND`/`BFIND` land *on* the match and skip the
+    /// character under the cursor; the move resolves to a no-op (and
+    /// the event reports inapplicable) when the character isn't found.
+    ///
+    /// The key after this event is consumed as the search target, the
+    /// same interception [`ReedlineEvent::QuotedInsert`] performs — a
+    /// `Char` key supplies the target character; any other key cancels
+    /// the search. Emacs default: `C-]` forward, `M-C-]` backward.
+    CharSearch {
+        /// Which way to search for the typed character
+        direction: Direction,
+    },
+
+    /// Insert an argument from the previous history line — GNU readline
+    /// `yank-last-arg` (`M-.`/`M-_`) and, with an explicit argument,
+    /// `yank-nth-arg` (kill.c:603-702).
+    ///
+    /// `count: None` yanks the last argument (GNU `'$'`); `Some(n)`
+    /// yanks argument `n`, where 0 is the command name and negatives
+    /// count back from the end. A consecutive repeat undoes the
+    /// previous insert and yanks the same argument from the
+    /// progressively older entry (GNU's `history_skip` walk); a negative
+    /// `count` on a repeat flips the walk direction, as in GNU.
+    ///
+    /// Caveat: GNU tokenizes the entry with full shell quoting rules
+    /// (`history_arg_extract`, histexpand.c:1424); this implementation
+    /// splits on whitespace, so a quoted `"two words"` counts as two
+    /// arguments here.
+    YankLastArg {
+        /// Which argument to yank — `None` for the last
+        count: Option<i32>,
+    },
+
+    /// Insert the `count`th argument of the previous history line —
+    /// GNU readline `yank-nth-arg` (`M-C-y`, kill.c:644
+    /// `rl_yank_nth_arg`). Unlike [`ReedlineEvent::YankLastArg`] this
+    /// is single-shot: repeating it inserts the same argument again
+    /// instead of walking older entries.
+    YankNthArg {
+        /// Which argument to yank — 0 is the command name, negatives
+        /// count back from the end
+        count: i32,
+    },
+
+    /// Accept the current line, and preload the *next* history entry
+    /// into the following `read_line` — GNU readline
+    /// `operate-and-get-next` (`C-o`, misc.c:782
+    /// `rl_operate_and_get_next`).
+    ///
+    /// The entry preloaded is the one after the history position the
+    /// line was submitted from: recalling entry `k` then pressing `C-o`
+    /// loads `k+1` (which, when `k` was the newest, is the just-accepted
+    /// line — GNU's `where_history()+history_base+1` produces the same).
+    /// On a fresh line there is no following entry and the next prompt
+    /// starts empty. The preload also positions the history cursor, so
+    /// `Up`/`Down` continue from the loaded entry.
+    OperateAndGetNext,
+
+    /// Search history using the buffer up to the insertion point as the
+    /// needle — GNU readline `history-search-backward` /
+    /// `history-search-forward` when `anchored` (search.c:713/675), and
+    /// `history-substr-search-backward` / `history-substr-search-forward`
+    /// otherwise (search.c:750/732).
+    ///
+    /// An anchored search requires the entry to *start with* the needle
+    /// and lands the cursor at the end of the needle; a substring
+    /// search matches anywhere and lands the cursor at the match
+    /// offset (GNU also sets `rl_mark` at the line end — not modeled
+    /// here). Consecutive presses continue the same search in either
+    /// direction; any other event reinitializes from the current
+    /// buffer. With an empty needle the event degrades to plain
+    /// previous/next-history traversal, exactly as GNU's
+    /// `_rl_history_search_len == 0` falls back to
+    /// `rl_get_previous_history`/`rl_get_next_history`.
+    ///
+    /// Not bound in the default emacs map (GNU leaves it unbound too);
+    /// hosts bind it directly, e.g. to `Up`/`Down` or `M-p`/`M-n`.
+    HistorySearch {
+        /// Older entries (`Backward`) or newer ones (`Forward`)
+        direction: Direction,
+        /// `true` for an anchored prefix match (GNU `history-search-*`),
+        /// `false` for a substring match (GNU `history-substr-search-*`)
+        anchored: bool,
+    },
+
+    /// The keypress was absorbed as the first half of a chord the edit
+    /// mode is still collecting — the `C-x` of GNU's `C-x )`, which is
+    /// a prefix *keymap* in the emacs map (`emacs_keymap.c:59`,
+    /// `ISKMAP emacs_ctlx_keymap`), flattened here into a one-key
+    /// pending state since `Keybindings` has no prefix tables.
+    ///
+    /// `Pending` produces no action; the next key resolves the chord.
+    /// The engine's macro recorder erases an absorbed prefix key from
+    /// the recording — GNU records it, then strips the resolved
+    /// sequence's whole key count when a chord reaches a macro command
+    /// (`macro.c:276`, `rl_key_sequence_length`), which nets out the
+    /// same for `C-x )` and additionally keeps aborted chords out of
+    /// the recording.
+    Pending,
+
+    /// Begin keyboard-macro recording (GNU `rl_start_kbd_macro`,
+    /// `macro.c:246` — `C-x (` in the emacs `C-x` map). Every later key
+    /// press is recorded verbatim until
+    /// [`EndKbdMacro`](ReedlineEvent::EndKbdMacro): keystrokes, not
+    /// commands (`readline.c:907`, `_rl_add_macro_char` runs ahead of
+    /// dispatch), so the recording replays through whatever keymap is
+    /// live then. Aborts — GNU dings — when already recording.
+    StartKbdMacro,
+
+    /// End keyboard-macro recording and keep it as the replayable last
+    /// macro (GNU `rl_end_kbd_macro`, `macro.c:270` — `C-x )`). The
+    /// keys that invoked it are not part of the recording (GNU
+    /// subtracts `rl_key_sequence_length`). An explicit numeric
+    /// argument makes GNU execute the new macro `count - 1` more
+    /// times, counting the definition as the first run (`macro.c:283`).
+    EndKbdMacro,
+
+    /// Replay the last recorded keyboard macro (GNU
+    /// `rl_call_last_kbd_macro`, `macro.c:291` — `C-x e`), a numeric
+    /// argument repeating it that many times. Refused while a
+    /// recording is in progress — GNU's "no recursive macros" —
+    /// replayed keys queue ahead of live input exactly like
+    /// [`KeySequence`](ReedlineEvent::KeySequence).
+    CallLastKbdMacro,
+
+    /// Accumulate a digit into the pending numeric argument (GNU
+    /// `rl_digit_argument`, `misc.c:230`): `Some(d)` is an `M-0`..`M-9`
+    /// key, `None` is `M--`, which negates the argument. Fully applied
+    /// at parse time — the argument is engine state and a real key
+    /// never reaches a handler; GNU reads the rest of the argument
+    /// inside `rl_digit_loop` (`misc.c:192`) instead.
+    DigitArgument(Option<u8>),
+
+    /// Multiply the pending numeric argument by four (GNU
+    /// `rl_universal_argument`, `misc.c:262`). Unbound in the default
+    /// emacs map — GNU binds `C-u` to `unix-line-discard` there
+    /// (`emacs_keymap.c:56`), which stays ours. Applied at parse time
+    /// like [`DigitArgument`](ReedlineEvent::DigitArgument).
+    UniversalArgument,
+
+    /// The key that terminated numeric-argument accumulation,
+    /// dispatched under the argument (GNU `misc.c`
+    /// `_rl_arg_dispatch:174`: every non-argument key ends the loop and
+    /// is itself dispatched with `count = rl_numeric_arg *
+    /// rl_arg_sign`).
+    ///
+    /// `explicit` mirrors `rl_explicit_arg` — set once a digit was
+    /// seen, or `M--` was upgraded to `-1` by GNU's `NUM_SAWMINUS`
+    /// rule (`misc.c:170`). Nothing consumes it yet; it is carried so
+    /// count-aware commands (GNU's yank-last-arg, overwrite-mode) can
+    /// later tell "no argument" from "the argument was 1".
+    WithArg {
+        /// `rl_numeric_arg * rl_arg_sign` (`readline.c:941`)
+        count: i32,
+        /// `rl_explicit_arg`
+        explicit: bool,
+        /// The terminating key's own event.
+        event: Box<ReedlineEvent>,
+    },
+
+    /// GNU `overwrite-mode` (misc.c rl_overwrite_mode, bound to the
+    /// Insert key): `None` toggles, `Some(on)` sets explicitly — the
+    /// explicit-arg form in GNU (`arg>0` overwrites, `arg<=0` inserts).
+    OverwriteMode(Option<bool>),
 }
 
 pub enum EventStatus {
     Handled,
     Inapplicable,
     Exits(Signal),
+}
+
+/// An edit that applied is a handled event, and one that had nothing to do
+/// is an inapplicable one, so a binding can fall through it.
+impl From<EditCommandStatus> for EventStatus {
+    fn from(status: EditCommandStatus) -> Self {
+        match status {
+            EditCommandStatus::Applied => EventStatus::Handled,
+            EditCommandStatus::Inapplicable => EventStatus::Inapplicable,
+        }
+    }
 }
 
 /// A wrapper for [crossterm::event::Event].

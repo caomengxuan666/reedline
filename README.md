@@ -23,6 +23,7 @@ It is currently primarily developed as the interactive editor for [nushell](http
   - [Integrate with `Hinter` for fish-style history autosuggestions](#integrate-with-hinter-for-fish-style-history-autosuggestions)
   - [Integrate with custom line completion `Validator`](#integrate-with-custom-line-completion-validator)
   - [Use custom `EditMode`](#use-custom-editmode)
+- [Default keybindings](./KEYBINDINGS.md)
 - [Crate features](#crate-features)
 - [Are we prompt yet? (Development status)](#are-we-prompt-yet-development-status)
 - [Contributing](./CONTRIBUTING.md)
@@ -190,14 +191,34 @@ let mut line_editor = Reedline::create().with_validator(validator);
 // This can define a keybinding setting or enable vi-emulation
 
 use reedline::{
-    default_vi_insert_keybindings, default_vi_normal_keybindings, EditMode, Reedline, Vi,
+    default_vi_insert_keybindings, default_vi_normal_keybindings, default_vi_visual_keybindings,
+    EditMode, Reedline, Vi,
 };
 
 let mut line_editor = Reedline::create().with_edit_mode(Box::new(Vi::new(
     default_vi_insert_keybindings(),
     default_vi_normal_keybindings(),
+    default_vi_visual_keybindings(),
 )));
 ```
+
+### Use `Helix` edit mode
+
+```rust
+// Selection-first editing: motions carry the selection, verbs act on it.
+
+use reedline::{default_helix_normal_keybindings, Helix, Reedline};
+
+let mut normal_keybindings = default_helix_normal_keybindings();
+// normal_keybindings.add_binding(..);
+
+let mut line_editor = Reedline::create()
+    .with_edit_mode(Box::new(Helix::default().with_normal_keybindings(normal_keybindings)));
+```
+
+Run `cargo run --example helix` for the mode on its own, or
+`cargo run --example demo -- --helix` to exercise it against the demo's
+history and menus.
 
 ## Crate features
 
@@ -205,7 +226,7 @@ let mut line_editor = Reedline::create().with_edit_mode(Box::new(Vi::new(
 - `bashisms`: Enable support for special text sequences that recall components from the history. e.g. `!!` and `!$`. For use in shells like `bash` or [`nushell`](https://nushell.sh).
 - `sqlite`: Provides the `SqliteBackedHistory` to store richer information in the history. Statically links the required sqlite version.
 - `sqlite-dynlib`: Alternative to the feature `sqlite`. Will not statically link. Requires `sqlite >= 3.38` to link dynamically!
-- `external_printer`: **Experimental:** Thread-safe `ExternalPrinter` handle to print lines from concurrently running threads.
+- `external_printer`: No-op, kept for compatibility. `ExternalPrinter` is always available.
 
 ## Are we prompt yet? (Development status)
 

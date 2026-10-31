@@ -1,16 +1,21 @@
 //! Collection of common functions that can be used to create menus
 use std::borrow::Cow;
-use unicase::UniCase;
+use std::ops::Range;
 
-use itertools::{
-    FoldWhile::{Continue, Done},
-    Itertools,
-};
 use nu_ansi_term::{ansi::RESET, Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{Editor, Suggestion, UndoBehavior};
+use crate::{
+    menu::{InputMode, MenuSettings, OutputMode},
+    painting::{escape_control, escape_control_keep_sgr, sgr_len, Painter},
+    CompletionOrigin, CompletionResult, Editor, Partial, Span, Suggestion, Suggestions,
+    UndoBehavior,
+};
+
+/// Appended to whatever `truncate_with_ansi` keeps, so callers must allow at
+/// least its width.
+const TRUNCATION_SUFFIX: &str = "...";
 
 /// Index result obtained from parsing a string with an index marker
 /// For example, the next string:
@@ -92,7 +97,7 @@ pub fn parse_selection_char(buffer: &str, marker: char) -> ParseResult<'_> {
                         marker: Some(&buffer[index..index + 2 * marker.len_utf8()]),
                         action: ParseAction::LastCommand,
                         prefix: None,
-                    }
+                    };
                 }
                 #[cfg(feature = "bashisms")]
                 Some(&x) if x == '$' => {
@@ -102,7 +107,7 @@ pub fn parse_selection_char(buffer: &str, marker: char) -> ParseResult<'_> {
                         marker: Some(&buffer[index..index + 2]),
                         action: ParseAction::LastToken,
                         prefix: None,
-                    }
+                    };
                 }
                 Some(&x) if x.is_ascii_digit() || x == '-' => {
                     let mut count: usize = 0;
@@ -115,8 +120,7 @@ pub fn parse_selection_char(buffer: &str, marker: char) -> ParseResult<'_> {
                         ParseAction::ForwardSearch
                     };
                     while let Some(&c) = input.peek() {
-                        if c.is_ascii_digit() {
-                            let c = c.to_digit(10).expect("already checked if is a digit");
+                        if let Some(c) = c.to_digit(10) {
                             let _ = input.next();
                             count *= 10;
                             count += c as usize;
@@ -147,7 +151,7 @@ pub fn parse_selection_char(buffer: &str, marker: char) -> ParseResult<'_> {
                         marker: Some(&buffer[index..index + marker.len_utf8()]),
                         action: ParseAction::BackwardPrefixSearch,
                         prefix: Some(&buffer[index + marker.len_utf8()..buffer.len()]),
-                    }
+                    };
                 }
                 None => {
                     return ParseResult {
@@ -156,7 +160,7 @@ pub fn parse_selection_char(buffer: &str, marker: char) -> ParseResult<'_> {
                         marker: Some(&buffer[index..buffer.len()]),
                         action: ParseAction::ForwardSearch,
                         prefix: Some(&buffer[index..buffer.len()]),
-                    }
+                    };
                 }
                 _ => {}
             }
@@ -173,128 +177,80 @@ pub fn parse_selection_char(buffer: &str, marker: char) -> ParseResult<'_> {
     }
 }
 
-/// Finds index for the common string in a list of suggestions
-pub fn find_common_string(values: &[Suggestion]) -> Option<(&Suggestion, usize)> {
-    let first_suggestion = values.first()?;
-    let max_len = first_suggestion.value.len();
-
-    let index = values
-        .iter()
-        .skip(1)
-        .fold_while(max_len, |cumulated_min, current_suggestion| {
-            let new_common_prefix_len = first_suggestion
-                .value
-                .char_indices()
-                .zip(current_suggestion.value.chars())
-                .find_map(|((idx, lhs), rhs)| (rhs != lhs).then_some(idx))
-                .unwrap_or(current_suggestion.value.len());
-            if new_common_prefix_len == 0 {
-                Done(0)
-            } else {
-                Continue(cumulated_min.min(new_common_prefix_len))
-            }
-        });
-
-    Some((first_suggestion, index.into_inner()))
-}
-
-/// Finds different string between two strings
+/// Find differing substring between two strings.
 ///
-/// ## Example usage
-/// ```
-/// use reedline::menu_functions::string_difference;
-///
-/// let new_string = "this is a new string";
-/// let old_string = "this is a string";
-///
-/// let res = string_difference(new_string, old_string);
-/// assert_eq!(res, (10, "new "));
-/// ```
+/// Skips the common prefix; if the rest of `old_string` is a suffix of what
+/// remains, the difference is the text in between, otherwise everything after
+/// the prefix. Returns the byte offset of the difference and the difference.
 pub fn string_difference<'a>(new_string: &'a str, old_string: &str) -> (usize, &'a str) {
-    if old_string.is_empty() {
-        return (0, new_string);
-    }
+    let prefix = new_string
+        .char_indices()
+        .zip(old_string.chars())
+        .take_while(|((_, n), o)| n == o)
+        .map(|((i, c), _)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
 
-    let old_chars = old_string.char_indices().collect::<Vec<(usize, char)>>();
-    let new_chars = new_string.char_indices().collect::<Vec<(usize, char)>>();
+    // `prefix` is a char boundary of both strings by construction, so the
+    // fallbacks are unreachable; they only keep the slicing panic-free.
+    let (_, old_rest) = old_string.split_at_checked(prefix).unwrap_or_default();
+    let (head, new_rest) = new_string.split_at_checked(prefix).unwrap_or_default();
+    let diff = new_rest.strip_suffix(old_rest).unwrap_or(new_rest);
 
-    let (_, start, end) = new_chars.iter().enumerate().fold(
-        (0, None, None),
-        |(old_char_index, start, end), (new_char_index, (_, c))| {
-            let equal = if start.is_some() {
-                if (old_chars.len() - old_char_index) == (new_chars.len() - new_char_index) {
-                    let new_iter = new_chars.iter().skip(new_char_index);
-                    let old_iter = old_chars.iter().skip(old_char_index);
-
-                    new_iter
-                        .zip(old_iter)
-                        .all(|((_, new), (_, old))| new == old)
-                } else {
-                    false
-                }
-            } else {
-                old_char_index == new_char_index && *c == old_chars[old_char_index].1
-            };
-
-            if equal {
-                let old_char_index = (old_char_index + 1).min(old_chars.len() - 1);
-
-                let end = match (start, end) {
-                    (Some(_), Some(_)) => end,
-                    (Some(_), None) => Some(new_char_index),
-                    _ => None,
-                };
-
-                (old_char_index, start, end)
-            } else {
-                let start = match start {
-                    Some(_) => start,
-                    None => Some(new_char_index),
-                };
-
-                (old_char_index, start, end)
-            }
-        },
-    );
-
-    // Convert char index to byte index
-    let start = start.map(|i| new_chars[i].0);
-    let end = end.map(|i| new_chars[i].0);
-
-    match (start, end) {
-        (Some(start), Some(end)) => (start, &new_string[start..end]),
-        (Some(start), None) => (start, &new_string[start..]),
-        (None, None) => (new_string.len(), ""),
-        (None, Some(_)) => unreachable!(),
-    }
+    (head.len(), diff)
 }
 
 /// Get the part of the line that should be given as input to the completer, as well
 /// as the index of the end of that piece of text
 ///
-/// `prev_input` is the text in the buffer when the menu was activated. Needed if only_buffer_difference is true
+/// `prev_input` is the text in the buffer when the menu was activated. Needed for `InputMode::Diff`.
 pub fn completer_input(
     buffer: &str,
     insertion_point: usize,
     prev_input: Option<&str>,
-    only_buffer_difference: bool,
+    input_mode: InputMode,
 ) -> (String, usize) {
-    if only_buffer_difference {
-        if let Some(old_string) = prev_input {
-            let (start, input) = string_difference(buffer, old_string);
-            if !input.is_empty() {
-                (input.to_owned(), start + input.len())
+    match input_mode {
+        InputMode::FullBuffer => (buffer.to_owned(), insertion_point),
+        InputMode::CursorPrefix => {
+            // TODO previously, all but the list menu replaced newlines with spaces here
+            // The completers should be adapted to account for this, and tests need to be added
+            (buffer[..insertion_point].to_owned(), insertion_point)
+        }
+        InputMode::Diff => {
+            if let Some(old_string) = prev_input {
+                let (start, input) = string_difference(buffer, old_string);
+                if !input.is_empty() {
+                    (input.to_owned(), start + input.len())
+                } else {
+                    (String::new(), insertion_point)
+                }
             } else {
                 (String::new(), insertion_point)
             }
-        } else {
-            (String::new(), insertion_point)
         }
-    } else {
-        // TODO previously, all but the list menu replaced newlines with spaces here
-        // The completers should be adapted to account for this, and tests need to be added
-        (buffer[..insertion_point].to_owned(), insertion_point)
     }
+}
+
+/// Stashes the buffer on first call when in `InputMode::Diff` (so later calls can diff
+/// against the original), then resolves the completer input via [`completer_input`].
+///
+/// Centralises the input-resolution boilerplate shared by all menu `update_values` impls.
+pub fn resolve_completer_input(
+    editor: &Editor,
+    saved_input: &mut Option<String>,
+    settings: &MenuSettings,
+) -> (String, usize) {
+    let mode = settings.effective_input_mode();
+    if mode == InputMode::Diff && saved_input.is_none() {
+        *saved_input = Some(editor.get_buffer().to_string());
+    }
+    completer_input(
+        editor.get_buffer(),
+        editor.completion_point(),
+        saved_input.as_deref(),
+        mode,
+    )
 }
 
 /// Find the closest index less than or equal to the current index that's a
@@ -313,67 +269,399 @@ pub fn floor_char_boundary(s: &str, index: usize) -> usize {
     }
 }
 
+/// Number of lines available for the menu body
+pub(crate) fn available_lines(painter: &Painter, min_rows: u16, max_lines: u16) -> u16 {
+    let lines = painter.remaining_lines_real().min(max_lines);
+    if lines == 0 {
+        // Handle the case where a prompt uses the entire screen.
+        // Drawing the menu has priority over the drawing the prompt.
+        painter.remaining_lines().min(min_rows)
+    } else {
+        lines
+    }
+}
+
+/// Scroll a fixed window so the selected row stays inside
+pub(crate) fn scroll_offset(selected: u16, current: u16, window: u16) -> u16 {
+    scroll_offset_usize(selected.into(), current.into(), window.into()).min(u16::MAX.into()) as u16
+}
+
+/// The same viewport calculation for menus whose choices outnumber terminal coordinates.
+pub(crate) fn scroll_offset_usize(selected: usize, current: usize, window: usize) -> usize {
+    if selected <= current {
+        // Selection is above the visible area, scroll up
+        selected
+    } else if selected >= current.saturating_add(window) {
+        // Selection is below the visible area, scroll down
+        selected.saturating_sub(window) + 1
+    } else {
+        // Selection is within the visible area
+        current
+    }
+}
+
+/// Where a menu stands between its activation and a final answer about the
+/// line on screen.
+///
+/// One value instead of three flags (`awaiting_results`, `provisional_results`,
+/// `opening`), whose invariants — pending implies provisional, and only a final
+/// answer may end the opening phase — lived in the update order rather than in
+/// a type that cannot express their violation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CompletionPhase {
+    /// Activated with nothing asked about the line yet: no answer is
+    /// outstanding and none is provisional.
+    #[default]
+    Unasked,
+    /// Only provisional answers so far. The menu stays off screen, so one
+    /// about to be closed by a lone suggestion never appears.
+    Opening(AnswerKind),
+    /// A final answer landed once. Later provisional answers keep the menu on
+    /// screen: stale values beat blanking it on every keystroke.
+    Open(AnswerKind),
+}
+
+/// How final the last answer was, as [`CompletionPhase`] remembers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnswerKind {
+    /// Computed for the line on screen.
+    Fresh,
+    /// Cached values for another line: shown, never decided on.
+    Stale,
+    /// Nothing yet; the background work is still running.
+    Pending,
+}
+
+impl CompletionPhase {
+    /// A new activation forgets the previous line's answer entirely.
+    pub(crate) fn on_activate(&mut self) {
+        *self = CompletionPhase::Unasked;
+    }
+
+    /// Fold the answer to an update into the phase.
+    pub(crate) fn note(&mut self, result: &CompletionResult) {
+        let kind = if result.is_pending() {
+            AnswerKind::Pending
+        } else if result.is_provisional() {
+            AnswerKind::Stale
+        } else {
+            AnswerKind::Fresh
+        };
+        *self = match (*self, kind) {
+            // Once open, no later answer can put the menu back off screen.
+            (CompletionPhase::Open(_), kind) => CompletionPhase::Open(kind),
+            // Only a final answer ends the opening phase.
+            (_, AnswerKind::Fresh) => CompletionPhase::Open(AnswerKind::Fresh),
+            (_, kind) => CompletionPhase::Opening(kind),
+        };
+    }
+
+    /// Whether the values on display may still be superseded.
+    pub(crate) fn provisional(self) -> bool {
+        match self {
+            CompletionPhase::Unasked => false,
+            CompletionPhase::Opening(kind) | CompletionPhase::Open(kind) => {
+                kind != AnswerKind::Fresh
+            }
+        }
+    }
+
+    /// Whether a background answer is still outstanding, so an empty menu
+    /// means "still computing" rather than "no records".
+    pub(crate) fn awaiting_results(self) -> bool {
+        matches!(
+            self,
+            CompletionPhase::Opening(AnswerKind::Pending)
+                | CompletionPhase::Open(AnswerKind::Pending)
+        )
+    }
+
+    /// Whether no final answer about the line on screen has landed yet.
+    pub(crate) fn awaiting_first_answer(self) -> bool {
+        !matches!(self, CompletionPhase::Open(_))
+    }
+}
+
+/// A menu's suggestions, tied to the buffer they were computed against.
+/// Spans are validated before reaching the buffer.
+#[derive(Default)]
+pub struct CompletionDisplay {
+    /// Menu suggestions (private; spans via accept/common_prefix)
+    values: Suggestions,
+    /// Display widths
+    pub display_widths: Vec<usize>,
+    /// Shortest of the strings the suggestions are based on.
+    pub shortest_base_string: String,
+    /// Width of the longest suggestion in `values`.
+    pub longest_suggestion: usize,
+    /// Completer-supplied partial (None = use derivation)
+    partial: Option<Partial>,
+    /// Buffer/cursor for span validation
+    computed_for: CompletionOrigin,
+}
+
+impl CompletionDisplay {
+    /// Build the display for a completion `result`, or `None` when there is
+    /// nothing to adopt yet.
+    pub fn from_result(
+        result: CompletionResult,
+        base_ranges: &[Range<usize>],
+        editor: &Editor,
+    ) -> Option<Self> {
+        match result {
+            CompletionResult::Pending => None,
+            CompletionResult::Fresh {
+                suggestions,
+                partial,
+            } => {
+                // Stamped from live editor (Fresh result)
+                let origin = CompletionOrigin::new(editor.get_buffer(), editor.insertion_point());
+                Some(Self::new(suggestions, partial, base_ranges, origin))
+            }
+            CompletionResult::Stale {
+                suggestions,
+                origin,
+                partial,
+            } => Some(Self::new(suggestions, partial, base_ranges, origin)),
+        }
+    }
+
+    /// Adopt suggestions and measure display metrics
+    fn new(
+        values: Suggestions,
+        partial: Option<Partial>,
+        base_ranges: &[Range<usize>],
+        computed_for: CompletionOrigin,
+    ) -> Self {
+        let values = escape_suggestions(values);
+        let display_widths: Vec<usize> = values
+            .iter()
+            .map(|suggestion| strip_ansi_escapes::strip_str(suggestion.display_value()).width())
+            .collect();
+
+        // Find the maximum width
+        let longest_suggestion = display_widths.iter().copied().max().unwrap_or(0);
+
+        // Shortest slice from stored buffer (may differ from editor if stale)
+        let buffer = computed_for.buffer.as_str();
+        let shortest_base_string = base_ranges
+            .iter()
+            .map(|range| {
+                let end_index = floor_char_boundary(buffer, range.end);
+                let start_index = floor_char_boundary(buffer, range.start).min(end_index);
+                &buffer[start_index..end_index]
+            })
+            .min_by_key(|buffer_slice| buffer_slice.width())
+            .map(String::from)
+            .unwrap_or_default();
+
+        Self {
+            values,
+            display_widths,
+            shortest_base_string,
+            longest_suggestion,
+            partial,
+            computed_for,
+        }
+    }
+
+    /// Read-only: values, descriptions, widths (no spans)
+    pub fn suggestions(&self) -> &[Suggestion] {
+        &self.values
+    }
+
+    /// Whether spans match the current editor buffer
+    fn is_current(&self, editor: &Editor) -> bool {
+        self.computed_for
+            .matches(editor.get_buffer(), editor.insertion_point())
+    }
+
+    /// Accept suggestion at index (no-op if stale or out of range)
+    pub fn accept(&self, index: usize, editor: &mut Editor, output_mode: Option<OutputMode>) {
+        if self.is_current(editor) {
+            replace_in_buffer(self.values.get(index).cloned(), editor, output_mode);
+        }
+    }
+
+    /// Apply partial completion (completer-supplied or derived). No-op and returns false when stale or unchanged.
+    pub fn common_prefix(&self, editor: &mut Editor) -> bool {
+        if !self.is_current(editor) {
+            return false;
+        }
+        match &self.partial {
+            Some(partial) => apply_partial(partial, editor),
+            None => match derive_common_prefix(editor.get_buffer(), &self.values) {
+                Some(partial) => apply_partial(&partial, editor),
+                None => false,
+            },
+        }
+    }
+}
+
+/// Escapes the control characters in what a menu shows of each suggestion,
+/// keeping the SGR styling of a `display_override`, description and extra
+/// (see [`escape_control_keep_sgr`]).
+///
+/// `value` is never touched: it is what accepting inserts, and the buffer
+/// renders it escaped. Escaping shifts the characters `match_indices` points
+/// at, so a rewritten entry drops them and its highlighting falls back to
+/// finding the typed text. A clean list keeps its `Arc`.
+pub(crate) fn escape_suggestions(values: Suggestions) -> Suggestions {
+    let mut escaped: Option<Vec<Suggestion>> = None;
+    for (i, suggestion) in values.iter().enumerate() {
+        if let Some(shown) = escape_suggestion(suggestion) {
+            escaped.get_or_insert_with(|| values.to_vec())[i] = shown;
+        }
+    }
+    escaped.map_or(values, Into::into)
+}
+
+/// `suggestion` with its shown fields escaped, if any of them needed it.
+fn escape_suggestion(suggestion: &Suggestion) -> Option<Suggestion> {
+    fn changed(text: Cow<str>) -> Option<String> {
+        match text {
+            Cow::Owned(text) => Some(text),
+            Cow::Borrowed(_) => None,
+        }
+    }
+    fn escaped(text: &str) -> Option<String> {
+        changed(escape_control_keep_sgr(text))
+    }
+
+    // Only a `display_override` is styled by the completer. Shown bare, `value`
+    // is data, so its SGR is escaped too.
+    let shown = match &suggestion.display_override {
+        Some(display) => escaped(display),
+        None => changed(escape_control(&suggestion.value)),
+    };
+
+    let mut out: Option<Suggestion> = None;
+    if let Some(shown) = shown {
+        let out = out.get_or_insert_with(|| suggestion.clone());
+        out.display_override = Some(shown);
+        out.match_indices = None;
+    }
+    if let Some(description) = suggestion.description.as_deref().and_then(escaped) {
+        out.get_or_insert_with(|| suggestion.clone()).description = Some(description);
+    }
+    if let Some(extra) = &suggestion.extra {
+        let shown: Vec<Cow<str>> = extra.iter().map(|e| escape_control_keep_sgr(e)).collect();
+        if shown.iter().any(|e| matches!(e, Cow::Owned(_))) {
+            out.get_or_insert_with(|| suggestion.clone()).extra =
+                Some(shown.into_iter().map(Cow::into_owned).collect());
+        }
+    }
+    out
+}
+
+/// Longest common prefix of what the suggestions would leave on the line.
+///
+/// Suggestions can replace different spans, such as `README.md` for `re` and
+/// `foo rebase` for `foo re`. Each one is read as the text it leaves between the
+/// earliest span start and the latest span end, so the prefix keeps only what every
+/// suggestion agrees on: here `foo `, which doesn't extend `foo re`.
+fn derive_common_prefix(line: &str, suggestions: &[Suggestion]) -> Option<Partial> {
+    // Snapped to char boundaries, so slicing `line` with them can't panic
+    let bounds = |span: Span| {
+        let end = floor_char_boundary(line, span.end);
+        (floor_char_boundary(line, span.start).min(end), end)
+    };
+    let (start, end) = suggestions
+        .iter()
+        .map(|s| bounds(s.span))
+        .reduce(|(start, end), (s_start, s_end)| (start.min(s_start), end.max(s_end)))?;
+    // Lazy `char` iterators, so only the first outcome is allocated
+    let mut outcomes = suggestions.iter().map(|s| {
+        let (s_start, s_end) = bounds(s.span);
+        line[start..s_start]
+            .chars()
+            .chain(s.value.chars())
+            .chain(line[s_end..end].chars())
+    });
+
+    let mut insert: String = outcomes.next()?.collect();
+    for mut outcome in outcomes {
+        let shared = insert
+            .char_indices()
+            .find_map(|(i, a)| (outcome.next() != Some(a)).then_some(i))
+            .unwrap_or(insert.len());
+        insert.truncate(shared);
+    }
+
+    let entered = &line[start..end];
+
+    // Ensure prefix extends (not overwrites) user input
+    let extends = !insert.is_empty()
+        && insert != entered
+        && insert
+            .as_str()
+            .to_lowercase()
+            .contains(&entered.to_lowercase());
+    extends.then_some(Partial {
+        span: Span::new(start, end),
+        insert,
+    })
+}
+
+/// Apply partial to buffer. No-op if buffer already matches
+fn apply_partial(partial: &Partial, editor: &mut Editor) -> bool {
+    let buffer = editor.get_buffer();
+    let end = floor_char_boundary(buffer, partial.span.end);
+    let start = floor_char_boundary(buffer, partial.span.start).min(end);
+    if buffer[start..end] == partial.insert {
+        return false;
+    }
+    commit_buffer_replacement(editor, start, end, &partial.insert);
+    true
+}
+
+/// Apply string replacement to line buffer
+fn commit_buffer_replacement(editor: &mut Editor, start: usize, end: usize, replacement: &str) {
+    // Use cursor head, clear selection
+    let mut line_buffer = std::mem::take(editor.line_buffer_mut());
+    let head = line_buffer.cursor().head();
+
+    line_buffer.replace_range(start..end, replacement);
+    line_buffer.clear_selection();
+    line_buffer.set_insertion_point(
+        head.saturating_add(replacement.len())
+            .saturating_sub(end - start),
+    );
+
+    editor.set_line_buffer(line_buffer, UndoBehavior::CreateUndoPoint);
+}
+
 /// Helper to accept a completion suggestion and edit the buffer
-pub fn replace_in_buffer(value: Option<Suggestion>, editor: &mut Editor) {
-    if let Some(Suggestion {
+pub fn replace_in_buffer(
+    value: Option<Suggestion>,
+    editor: &mut Editor,
+    output_mode: Option<OutputMode>,
+) {
+    let Some(Suggestion {
         mut value,
         span,
         append_whitespace,
         ..
     }) = value
-    {
-        let end = floor_char_boundary(editor.get_buffer(), span.end);
-        let start = floor_char_boundary(editor.get_buffer(), span.start).min(end);
-        if append_whitespace {
-            value.push(' ');
-        }
+    else {
+        return;
+    };
 
-        let mut line_buffer = editor.line_buffer().clone();
-        line_buffer.replace_range(start..end, &value);
-        let mut offset = line_buffer.insertion_point();
-        offset = offset.saturating_add(value.len());
-        offset = offset.saturating_sub(end.saturating_sub(start));
-        line_buffer.set_insertion_point(offset);
-        editor.set_line_buffer(line_buffer, UndoBehavior::CreateUndoPoint);
+    let buffer = editor.get_buffer();
+    let (raw_start, raw_end) = match output_mode {
+        Some(OutputMode::FullBuffer) => (0, buffer.len()),
+        Some(OutputMode::ExtendToEnd) => (span.start, buffer.len()),
+        Some(OutputMode::SuggestedSpan) | None => (span.start, span.end),
+    };
+
+    let end = floor_char_boundary(buffer, raw_end);
+    let start = floor_char_boundary(buffer, raw_start).min(end);
+
+    if append_whitespace {
+        value.push(' ');
     }
-}
 
-/// Helper for `Menu::can_partially_complete`
-pub fn can_partially_complete(values: &[Suggestion], editor: &mut Editor) -> bool {
-    if let Some((Suggestion { value, span, .. }, index)) = find_common_string(values) {
-        let matching = &value[0..index];
-        let end = floor_char_boundary(editor.get_buffer(), span.end);
-        let start = floor_char_boundary(editor.get_buffer(), span.start).min(end);
-
-        // make sure that the partial completion does not overwrite user entered input
-        let entered_input = &editor.get_buffer()[start..end];
-        let extends_input = UniCase::new(matching)
-            .to_folded_case()
-            .contains(&UniCase::new(entered_input).to_folded_case())
-            && matching != entered_input;
-
-        if !matching.is_empty() && extends_input {
-            let mut line_buffer = editor.line_buffer().clone();
-            line_buffer.replace_range(start..end, matching);
-
-            let offset = if matching.len() < (end - start) {
-                line_buffer
-                    .insertion_point()
-                    .saturating_sub((end - start) - matching.len())
-            } else {
-                line_buffer.insertion_point() + matching.len() - (end - start)
-            };
-
-            line_buffer.set_insertion_point(offset);
-            editor.set_line_buffer(line_buffer, UndoBehavior::CreateUndoPoint);
-
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    }
+    commit_buffer_replacement(editor, start, end, &value);
 }
 
 #[derive(Debug, PartialEq)]
@@ -408,35 +696,19 @@ fn parse_ansi<'a>(s: &'a str) -> Vec<AnsiSegment<'a>> {
     let mut segments = Vec::new();
 
     let find_escape_end = |sgr_args_start: usize| {
+        let csi_start = sgr_args_start - ANSI_SGR_START.len();
+        // `sgr_len` decides what counts as SGR, so the escaping that keeps
+        // these sequences and the parsing here cannot disagree.
+        let escape_end = csi_start + sgr_len(&s[csi_start..])?;
         let mut escape_start = sgr_args_start;
         let mut contains_reset = false;
         // Whether all digits of the current argument have been 0 so far (this
         // is true for empty arguments too). A 0 (or empty argument) represents
         // the reset attribute.
         let mut all_zeroes = true;
-        for (i, c) in s[sgr_args_start..].char_indices() {
+        for (i, c) in s[sgr_args_start..escape_end - 1].char_indices() {
             match c {
-                'm' => {
-                    let csi_start = sgr_args_start - ANSI_SGR_START.len();
-                    let escape_end = sgr_args_start + i + 1;
-                    if all_zeroes {
-                        return Some(AnsiEscape {
-                            csi_start,
-                            escape_start: None,
-                            escape_end,
-                            had_reset: true,
-                        });
-                    } else {
-                        return Some(AnsiEscape {
-                            csi_start,
-                            escape_start: Some(escape_start),
-                            escape_end,
-                            had_reset: contains_reset,
-                        });
-                    }
-                }
                 '0' => {}
-                '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' => all_zeroes = false,
                 ';' => {
                     if all_zeroes {
                         contains_reset = true;
@@ -444,11 +716,25 @@ fn parse_ansi<'a>(s: &'a str) -> Vec<AnsiSegment<'a>> {
                     }
                     all_zeroes = true;
                 }
-                _ => return None,
+                // `1` to `9`: `sgr_len` let nothing else through.
+                _ => all_zeroes = false,
             }
         }
-        // No ending "m" to terminate SGR sequence
-        None
+        Some(if all_zeroes {
+            AnsiEscape {
+                csi_start,
+                escape_start: None,
+                escape_end,
+                had_reset: true,
+            }
+        } else {
+            AnsiEscape {
+                csi_start,
+                escape_start: Some(escape_start),
+                escape_end,
+                had_reset: contains_reset,
+            }
+        })
     };
 
     let find_escape = |mut search_start: usize| {
@@ -611,82 +897,238 @@ pub fn get_match_indices<'a>(
     }
 }
 
+/// Where `truncate_with_ansi` cuts: segments before `segment` are kept whole,
+/// then the first `byte` bytes of `segment`, then the suffix.
+struct Cut {
+    segment: usize,
+    /// Always a grapheme boundary within that segment's text.
+    byte: usize,
+}
+
+/// How one segment sits against the width budget once everything before it
+/// has been laid out.
+enum Fit {
+    /// The segment fits, and the suffix would still fit after it.
+    WithDots,
+    /// The segment fits, but the suffix after it would not: if anything later
+    /// overflows, the cut has to land inside this segment.
+    WithoutDots,
+    /// The segment itself does not fit.
+    Overflows,
+}
+
+fn fit(current_width: usize, segment_width: usize, suffix_width: usize, max_width: usize) -> Fit {
+    let end = current_width + segment_width;
+    if end > max_width {
+        Fit::Overflows
+    } else if end + suffix_width > max_width {
+        Fit::WithoutDots
+    } else {
+        Fit::WithDots
+    }
+}
+
+/// Byte length of the longest prefix of `text` whose display width is at most `budget`.
+///
+/// Walks graphemes so a wide or combining character is never split; a
+/// grapheme that would overshoot the budget stops the walk.
+fn prefix_len_within_width(text: &str, budget: usize) -> usize {
+    let mut remaining = budget;
+    let mut end = 0;
+    for (start, grapheme) in text.grapheme_indices(true) {
+        let width = grapheme.width();
+        if width > remaining {
+            break;
+        }
+        end = start + grapheme.len();
+        remaining -= width;
+    }
+    end
+}
+
 /// Truncate a string with ANSI escapes to the given max width, which must be >=3.
 ///
 /// If `s` is longer than `max_width`, the resulting string will end in "..."
 /// and have width at most `max_width`.
 pub(crate) fn truncate_with_ansi(s: &str, max_width: usize) -> Cow<'_, str> {
-    let trunc_suffix = "...";
-    let suffix_width = trunc_suffix.width();
+    let suffix_width = TRUNCATION_SUFFIX.width();
+    let segments = parse_ansi(s);
 
-    let ansi_segments = parse_ansi(s);
-    let mut curr_width = 0;
-    let mut should_trunc = false;
-    let mut max_ind_trunc = 0;
-    let mut trunc_grapheme_ind = 0;
-    for (i, segment) in ansi_segments.iter().enumerate() {
+    // The cut lands at the first place the suffix stops fitting: inside the
+    // first `WithoutDots` segment after a clean boundary, or failing that
+    // inside the segment that overflows. `pending` holds the former until we
+    // know whether anything overflows at all; a `WithDots` segment resets it
+    // since the suffix fits cleanly after that one again.
+    let mut current_width = 0;
+    let mut pending: Option<Cut> = None;
+    let mut cut: Option<Cut> = None;
+    for (i, segment) in segments.iter().enumerate() {
         let segment_width = segment.text.width();
-
-        should_trunc = curr_width + segment_width > max_width;
-
-        let too_long_with_dots = curr_width + segment_width + suffix_width > max_width;
-        if !too_long_with_dots {
-            max_ind_trunc = i + 1;
-        }
-
-        if should_trunc || too_long_with_dots {
-            let mut allowed_width = max_width
-                .saturating_sub(curr_width)
-                .saturating_sub(suffix_width);
-            for (ind, grapheme) in segment.text.grapheme_indices(true) {
-                let grapheme_width = grapheme.width();
-                if grapheme_width > allowed_width {
-                    break;
+        let budget = max_width
+            .saturating_sub(current_width)
+            .saturating_sub(suffix_width);
+        match fit(current_width, segment_width, suffix_width, max_width) {
+            Fit::WithDots => pending = None,
+            Fit::WithoutDots => {
+                if pending.is_none() {
+                    pending = Some(Cut {
+                        segment: i,
+                        byte: prefix_len_within_width(segment.text, budget),
+                    })
                 }
-                trunc_grapheme_ind = ind + grapheme.len();
-                allowed_width = allowed_width.saturating_sub(grapheme_width);
             }
-            if should_trunc {
+            Fit::Overflows => {
+                cut = Some(pending.take().unwrap_or_else(|| Cut {
+                    segment: i,
+                    byte: prefix_len_within_width(segment.text, budget),
+                }));
                 break;
             }
         }
-
-        curr_width += segment_width;
+        current_width += segment_width;
     }
 
-    if should_trunc {
-        let mut res = String::new();
-        for (i, segment) in ansi_segments[0..max_ind_trunc].iter().enumerate() {
-            if let Some(escape) = segment.escape {
-                res.push_str(ANSI_SGR_START);
-                res.push_str(escape);
-            } else if i > 0 {
-                // No need to put a RESET at the beginning of the string
-                res.push_str(RESET);
-            }
-            res.push_str(segment.text);
-        }
-        let last = &ansi_segments[max_ind_trunc];
-        if let Some(escape) = last.escape {
+    let Some(Cut { segment, byte }) = cut else {
+        return Cow::Borrowed(s);
+    };
+    // `segment` is an index the loop above produced, so both lookups hold; if
+    // they ever did not, an untruncated string beats a panic while painting.
+    let Some((keep, rest)) = segments.split_at_checked(segment) else {
+        return Cow::Borrowed(s);
+    };
+    let Some(last) = rest.first() else {
+        return Cow::Borrowed(s);
+    };
+
+    let mut res = String::new();
+    for (i, segment) in keep.iter().enumerate() {
+        if let Some(escape) = segment.escape {
             res.push_str(ANSI_SGR_START);
             res.push_str(escape);
-        } else if max_ind_trunc > 0 {
+        } else if i > 0 {
+            // No need to put a RESET at the beginning of the string
             res.push_str(RESET);
         }
-        res.push_str(&last.text[0..trunc_grapheme_ind]);
-        res.push_str(trunc_suffix);
-        Cow::Owned(res)
-    } else {
-        Cow::Borrowed(s)
+        res.push_str(segment.text);
     }
+    // The cut segment's escape is emitted even when none of its text survives,
+    // so the suffix carries its style.
+    if let Some(escape) = last.escape {
+        res.push_str(ANSI_SGR_START);
+        res.push_str(escape);
+    } else if segment > 0 {
+        res.push_str(RESET);
+    }
+    res.push_str(last.text.get(..byte).unwrap_or(""));
+    res.push_str(TRUNCATION_SUFFIX);
+    Cow::Owned(res)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EditCommand, LineBuffer, Span};
+    use crate::PromptHelixMode;
+    use crate::{
+        Completer, DefaultCompleter, EditCommand, LineBuffer, PromptEditMode, PromptViMode,
+    };
     use nu_ansi_term::Color;
     use rstest::rstest;
+
+    #[test]
+    fn suggestions_show_escape_sequences_but_keep_their_value() {
+        let poisoned = Suggestion {
+            value: "foo\x1b[2Kbar".into(),
+            description: Some("\x1b]52;c;aGk=\x07".into()),
+            extra: Some(vec!["\x1b[Gx".into()]),
+            match_indices: Some(vec![0, 1, 2]),
+            ..Default::default()
+        };
+        // nushell styles `display_override` with SGR; that has to survive.
+        let styled = Suggestion {
+            value: "sirlancelot".into(),
+            display_override: Some("sir\x1b[1mlancelot".into()),
+            match_indices: Some(vec![0]),
+            ..Default::default()
+        };
+        // A bare `value` is data, a file name or a history entry: its SGR could
+        // hide part of the entry, so it is shown escaped like any other control.
+        let concealed = Suggestion {
+            value: "\x1b[8mevil\x1b[0mfoo".into(),
+            ..Default::default()
+        };
+        let values: Suggestions = vec![poisoned.clone(), styled.clone(), concealed.clone()].into();
+
+        let escaped = escape_suggestions(values);
+
+        assert_eq!(escaped[0].value, poisoned.value);
+        assert_eq!(escaped[0].display_value(), "foo^[[2Kbar");
+        assert_eq!(escaped[0].description.as_deref(), Some("^[]52;c;aGk=^G"));
+        assert_eq!(escaped[0].extra, Some(vec!["^[[Gx".to_string()]));
+        assert_eq!(escaped[0].match_indices, None);
+        assert_eq!(escaped[1], styled);
+        assert_eq!(escaped[2].value, concealed.value);
+        assert_eq!(escaped[2].display_value(), "^[[8mevil^[[0mfoo");
+    }
+
+    #[test]
+    fn clean_suggestions_keep_their_allocation() {
+        let values: Suggestions = vec![Suggestion {
+            value: "plain".into(),
+            ..Default::default()
+        }]
+        .into();
+        let escaped = escape_suggestions(values.clone());
+        assert!(std::sync::Arc::ptr_eq(&values, &escaped));
+    }
+
+    /// A caret cursor rests on the last grapheme of the word, so completion must
+    /// count that grapheme as part of the word instead of stranding it after the
+    /// replacement (`foo` + `foobar` used to yield `foobaro`).
+    #[rstest]
+    #[case::helix_normal(PromptEditMode::Helix(PromptHelixMode::Normal), "foo", "foobar")]
+    #[case::vi_normal(PromptEditMode::Vi(PromptViMode::Normal), "foo", "foobar")]
+    // The covered grapheme is multi-byte: stepping by bytes would split it.
+    #[case::multibyte(PromptEditMode::Helix(PromptHelixMode::Normal), "café", "cafétería")]
+    fn completion_covers_the_caret_grapheme(
+        #[case] mode: PromptEditMode,
+        #[case] buffer: &str,
+        #[case] expected: &str,
+    ) {
+        use crate::{menu::MenuSettings, Completer, DefaultCompleter};
+
+        let mut completer = DefaultCompleter::default();
+        completer.insert(vec![expected.to_string()]);
+
+        let mut editor = Editor::default();
+        let mut lb = LineBuffer::new();
+        lb.set_buffer(buffer.to_string());
+        editor.set_line_buffer(lb, UndoBehavior::CreateUndoPoint);
+        editor.set_edit_mode(mode);
+
+        let mut saved = None;
+        let (input, pos) = resolve_completer_input(&editor, &mut saved, &MenuSettings::default());
+        let suggestions = completer.complete(&input, pos);
+        replace_in_buffer(
+            suggestions.suggestions().first().cloned(),
+            &mut editor,
+            None,
+        );
+
+        assert_eq!(editor.get_buffer(), expected);
+    }
+
+    /// Insert mode has no caret widening, so it must keep the plain insertion
+    /// point — the guard against the fix leaking into bar-cursor modes.
+    #[test]
+    fn completion_point_is_untouched_for_bar_cursors() {
+        let mut editor = Editor::default();
+        let mut lb = LineBuffer::new();
+        lb.set_buffer("foo".to_string());
+        editor.set_line_buffer(lb, UndoBehavior::CreateUndoPoint);
+        editor.set_edit_mode(PromptEditMode::Vi(PromptViMode::Insert));
+
+        assert_eq!(editor.completion_point(), editor.insertion_point());
+    }
 
     #[test]
     fn parse_row_test() {
@@ -828,103 +1270,33 @@ mod tests {
         assert!(matches!(res.action, ParseAction::BackwardSearch));
     }
 
-    #[test]
-    fn string_difference_test() {
-        let new_string = "this is a new string";
-        let old_string = "this is a string";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (10, "new "));
-    }
-
-    #[test]
-    fn string_difference_new_larger() {
-        let new_string = "this is a new string";
-        let old_string = "this is";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (7, " a new string"));
-    }
-
-    #[test]
-    fn string_difference_new_shorter() {
-        let new_string = "this is the";
-        let old_string = "this is the original";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (11, ""));
-    }
-
-    #[test]
-    fn string_difference_inserting() {
-        let new_string = "let a = (insert) | ";
-        let old_string = "let a = () | ";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (9, "insert"));
-    }
-
-    #[test]
-    fn string_difference_longer_string() {
-        let new_string = "this is a new another";
-        let old_string = "this is a string";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (10, "new another"));
-    }
-
-    #[test]
-    fn string_difference_start_same() {
-        let new_string = "this is a new something string";
-        let old_string = "this is a string";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (10, "new something "));
-    }
-
-    #[test]
-    fn string_difference_empty_old() {
-        let new_string = "this new another";
-        let old_string = "";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (0, "this new another"));
-    }
-
-    #[test]
-    fn string_difference_very_difference() {
-        let new_string = "this new another";
-        let old_string = "complete different string";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (0, "this new another"));
-    }
-
-    #[test]
-    fn string_difference_both_equal() {
-        let new_string = "this new another";
-        let old_string = "this new another";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (16, ""));
-    }
-
-    #[test]
-    fn string_difference_with_non_ansi() {
-        let new_string = "ｎｕｓｈｅｌｌ";
-        let old_string = "ｎｕｌｌ";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (6, "ｓｈｅ"));
-    }
-
-    #[test]
-    fn string_difference_with_repeat() {
-        let new_string = "ee";
-        let old_string = "e";
-
-        let res = string_difference(new_string, old_string);
-        assert_eq!(res, (1, "e"));
+    #[rstest]
+    #[case::inserted_word("this is a new string", "this is a string", 10, "new ")]
+    #[case::appended("this is a new string", "this is", 7, " a new string")]
+    #[case::new_shorter("this is the", "this is the original", 11, "")]
+    #[case::inserted_inside_parens("let a = (insert) | ", "let a = () | ", 9, "insert")]
+    #[case::tail_differs("this is a new another", "this is a string", 10, "new another")]
+    #[case::inserted_words(
+        "this is a new something string",
+        "this is a string",
+        10,
+        "new something "
+    )]
+    #[case::empty_old("this new another", "", 0, "this new another")]
+    #[case::nothing_shared("this new another", "complete different string", 0, "this new another")]
+    #[case::equal("this new another", "this new another", 16, "")]
+    #[case::multibyte_diff("ｎｕｓｈｅｌｌ", "ｎｕｌｌ", 6, "ｓｈｅ")]
+    #[case::multibyte_prefix("héllo wörld", "héllo", 6, " wörld")]
+    #[case::repeat("ee", "e", 1, "e")]
+    #[case::repeat_twice("eee", "e", 1, "ee")]
+    #[case::old_is_prefix_and_reappears("abcb", "ab", 2, "cb")]
+    fn string_difference_is_the_text_typed_after_the_prefix(
+        #[case] new: &str,
+        #[case] old: &str,
+        #[case] start: usize,
+        #[case] diff: &str,
+    ) {
+        assert_eq!(string_difference(new, old), (start, diff));
     }
 
     #[rstest]
@@ -934,7 +1306,7 @@ mod tests {
     #[case::unsorted(vec!["a", "b", "ab"], 0)]
     #[case::should_be_case_sensitive(vec!["a", "A"], 0)]
     #[case::first_suggestion_longest(vec!["foobar", "foo"], 3)]
-    fn test_find_common_string(#[case] input: Vec<&str>, #[case] expected: usize) {
+    fn test_derive_common_prefix(#[case] input: Vec<&str>, #[case] expected: usize) {
         let input: Vec<_> = input
             .into_iter()
             .map(|s| Suggestion {
@@ -942,30 +1314,142 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let (_, len) = find_common_string(&input).unwrap();
+        // Shared default span, empty buffer: gate reduces to "non-empty prefix?"
+        let partial = derive_common_prefix("", &input);
 
-        assert!(len == expected);
+        match expected {
+            0 => assert!(partial.is_none()),
+            len => assert_eq!(partial.unwrap().insert.len(), len),
+        }
+    }
+
+    /// Editor holding `line`, with the cursor at its end
+    fn editor_with(line: &str) -> Editor {
+        let mut editor = Editor::default();
+        editor.set_buffer(line.to_string(), UndoBehavior::CreateUndoPoint);
+        editor
+    }
+
+    /// Fresh display for `values`, without a completer-supplied partial
+    fn display_for(editor: &Editor, values: Vec<Suggestion>) -> CompletionDisplay {
+        CompletionDisplay::from_result(CompletionResult::fresh(values), &[], editor)
+            .expect("a fresh result always has a display")
+    }
+
+    /// Tab on `line` with suggestions that replace different spans: only text that
+    /// every suggestion would leave on the line is inserted.
+    #[rstest]
+    // nushell `foo re`: a file replaces `re`, subcommands replace `foo re`
+    #[case::file_first(
+        "foo re",
+        &[("README.md", 4..6), ("foo rebase", 0..6), ("foo rebuild", 0..6)],
+        "foo re"
+    )]
+    #[case::subcommands_first(
+        "foo re",
+        &[("foo rebase", 0..6), ("foo rebuild", 0..6), ("README.md", 4..6)],
+        "foo re"
+    )]
+    #[case::spans_agree_in_part("foo re", &[("rebase", 4..6), ("foo rebuild", 0..6)], "foo reb")]
+    #[case::spans_agree("x ab", &[("abc1", 2..4), ("abc2", 2..4), ("x abc3", 0..4)], "x abc")]
+    // `abcb` (`a` replaced, `b` kept) and `abcd` share `abc`
+    #[case::ends_differ("ab", &[("abc", 0..1), ("abcd", 0..2)], "abc")]
+    fn common_prefix_keeps_what_every_span_agrees_on(
+        #[case] line: &str,
+        #[case] values: &[(&str, Range<usize>)],
+        #[case] expected: &str,
+    ) {
+        let mut editor = editor_with(line);
+        let values = values
+            .iter()
+            .map(|(value, range)| Suggestion {
+                value: value.to_string(),
+                span: Span::new(range.start, range.end),
+                ..Default::default()
+            })
+            .collect();
+        let display = display_for(&editor, values);
+
+        assert_eq!(display.common_prefix(&mut editor), line != expected);
+        assert_eq!(editor.get_buffer(), expected);
+    }
+
+    /// Mirrors demo example: `DefaultCompleter` suggests entries for the last word
+    /// (replacing `th` or `he`) and for the whole line (replacing all of it).
+    #[rstest]
+    // `this is the reedline crate` over `th` would repeat `this is `
+    #[case::disagree("this is th", "this is th")]
+    // `hello world` for the last word, `hello word` for the line
+    #[case::agree_in_part(
+        "hello another very large option for hello w",
+        "hello another very large option for hello wor"
+    )]
+    #[case::agree(
+        "hello another very large option for he",
+        "hello another very large option for hello "
+    )]
+    fn common_prefix_over_default_completer_word_groups(
+        #[case] line: &str,
+        #[case] expected: &str,
+    ) {
+        let mut completer = DefaultCompleter::new_with_wordlen(
+            vec![
+                "test".into(),
+                "hello world".into(),
+                "hello another very large option for hello word that will force one column".into(),
+                "this is the reedline crate".into(),
+            ],
+            2,
+        );
+        let mut editor = editor_with(line);
+        let display =
+            CompletionDisplay::from_result(completer.complete(line, line.len()), &[], &editor)
+                .expect("a fresh result always has a display");
+
+        assert_eq!(display.common_prefix(&mut editor), line != expected);
+        assert_eq!(editor.get_buffer(), expected);
+    }
+
+    /// Verifies fallback to built-in derivation without completer-supplied Partial
+    #[test]
+    fn common_prefix_falls_back_to_derivation_without_a_completer_supplied_partial() {
+        let mut editor = editor_with("ab");
+
+        // Mirrors demo example: "ab" + Tab -> longest prefix "abaaa"
+        let values = ["abaaacas", "abaaac", "abaaaxyc", "abaaarabc"]
+            .into_iter()
+            .map(|value| Suggestion {
+                value: value.to_string(),
+                span: Span::new(0, 2),
+                ..Default::default()
+            })
+            .collect();
+        let display = display_for(&editor, values);
+
+        assert!(display.common_prefix(&mut editor));
+        assert_eq!(editor.get_buffer(), "abaaa");
     }
 
     #[rstest]
-    #[case("foobar", 6, None, false, "foobar", 6)]
-    #[case("foo\r\nbar", 5, None, false, "foo\r\n", 5)]
-    #[case("foo\nbar", 4, None, false, "foo\n", 4)]
-    #[case("foobar", 6, None, true, "", 6)]
-    #[case("foobar", 3, Some("foobar"), true, "", 3)]
-    #[case("foobar", 6, Some("foo"), true, "bar", 6)]
-    #[case("foobar", 6, Some("for"), true, "oba", 5)]
+    #[case("foobar", 6, None, InputMode::CursorPrefix, "foobar", 6)]
+    #[case("foo\r\nbar", 5, None, InputMode::CursorPrefix, "foo\r\n", 5)]
+    #[case("foo\nbar", 4, None, InputMode::CursorPrefix, "foo\n", 4)]
+    #[case("foobar", 6, None, InputMode::Diff, "", 6)]
+    #[case("foobar", 3, Some("foobar"), InputMode::Diff, "", 3)]
+    #[case("foobar", 6, Some("foo"), InputMode::Diff, "bar", 6)]
+    #[case("foobar", 6, Some("for"), InputMode::Diff, "oba", 5)]
+    #[case("foobar baz", 3, None, InputMode::FullBuffer, "foobar baz", 3)]
     fn test_completer_input(
         #[case] buffer: String,
         #[case] insertion_point: usize,
         #[case] prev_input: Option<&str>,
-        #[case] only_buffer_difference: bool,
+        #[case] input_mode: InputMode,
         #[case] output: String,
         #[case] pos: usize,
     ) {
         assert_eq!(
             (output, pos),
-            completer_input(&buffer, insertion_point, prev_input, only_buffer_difference)
+            completer_input(&buffer, insertion_point, prev_input, input_mode)
         )
     }
 
@@ -994,6 +1478,57 @@ mod tests {
                 ..Default::default()
             }),
             &mut editor,
+            None,
+        );
+        assert_eq!(new_buffer, editor.get_buffer());
+        assert_eq!(new_insertion_point, editor.insertion_point());
+
+        editor.run_edit_command(&EditCommand::Undo);
+        assert_eq!(orig_buffer, editor.get_buffer());
+        assert_eq!(orig_insertion_point, editor.insertion_point());
+    }
+
+    #[rstest]
+    #[case::full_buffer(
+        "old content",
+        11,
+        "new",
+        3,
+        "new",
+        Span::new(0, 0),
+        OutputMode::FullBuffer
+    )]
+    #[case::extend_to_end(
+        "hello world",
+        11,
+        "hello rust",
+        10,
+        "rust",
+        Span::new(6, 8),
+        OutputMode::ExtendToEnd
+    )]
+    fn test_replace_in_buffer_with_output_mode(
+        #[case] orig_buffer: &str,
+        #[case] orig_insertion_point: usize,
+        #[case] new_buffer: &str,
+        #[case] new_insertion_point: usize,
+        #[case] value: String,
+        #[case] span: Span,
+        #[case] output_mode: OutputMode,
+    ) {
+        let mut editor = Editor::default();
+        let mut line_buffer = LineBuffer::new();
+        line_buffer.set_buffer(orig_buffer.to_owned());
+        line_buffer.set_insertion_point(orig_insertion_point);
+        editor.set_line_buffer(line_buffer, UndoBehavior::CreateUndoPoint);
+        replace_in_buffer(
+            Some(Suggestion {
+                value,
+                span,
+                ..Default::default()
+            }),
+            &mut editor,
+            Some(output_mode),
         );
         assert_eq!(new_buffer, editor.get_buffer());
         assert_eq!(new_insertion_point, editor.insertion_point());
@@ -1155,6 +1690,35 @@ mod tests {
     #[case::no_ansi_nothing_left("foobar", 3, "...")]
     #[case::trunc_with_short_segments("foobar\x1b[1;ma\x1b[2;mb\x1b[3;mc", 8, "fooba...")]
     #[case::trunc_with_long_segment("foo\x1b[1;mBarbaz\x1b[2;mExtra", 8, "foo\x1b[0mBa...")]
+    // The cases below pin which segment the cut lands in and where inside it,
+    // with well-formed SGR escapes (no trailing `;`, which the parser reads as a reset).
+    #[case::style_survives_the_cut("\x1b[1mabcdef", 4, "\x1b[1ma...")]
+    #[case::cut_on_a_segment_boundary_keeps_its_escape("ab\x1b[1mcd\x1b[2mef", 5, "ab\x1b[1m...")]
+    #[case::earlier_segment_fits_only_without_dots(
+        "ab\x1b[1mcd\x1b[2mefgh",
+        7,
+        "ab\x1b[1mcd\x1b[2m..."
+    )]
+    #[case::cut_lands_in_the_first_of_two_without_dots(
+        "ab\x1b[1mcd\x1b[2me\x1b[3mfghij",
+        6,
+        "ab\x1b[1mc..."
+    )]
+    #[case::overflow_segment_has_no_room_left(
+        "abc\x1b[1mde\x1b[2mfghij",
+        8,
+        "abc\x1b[1mde\x1b[2m..."
+    )]
+    #[case::wide_grapheme_starts_the_overflow_segment(
+        "ab\x1b[1m\u{ff28}\u{ff28}\x1b[2mcd",
+        5,
+        "ab\x1b[1m..."
+    )]
+    #[case::empty_text_segment_between_escapes("a\x1b[1m\x1b[2mbcdefg", 5, "a\x1b[1m\x1b[2mb...")]
+    #[case::reset_inside_the_kept_part("\x1b[1mab\x1b[0mcdef", 5, "\x1b[1mab\x1b[0m...")]
+    #[case::reset_after_the_cut("\x1b[1mab\x1b[0mcdef", 4, "\x1b[1ma...")]
+    #[case::max_width_below_the_suffix("abcdef", 2, "...")]
+    #[case::max_width_zero("abcdef", 0, "...")]
     fn test_truncate_with_ansi(
         #[case] value: &str,
         #[case] max_width: usize,

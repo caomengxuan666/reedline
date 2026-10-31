@@ -42,8 +42,8 @@ impl Hinter for CwdAwareHinter {
                     }
                 })
                 .unwrap_or_default();
-            if !with_cwd.is_empty() {
-                with_cwd[0]
+            if let Some(first) = with_cwd.first() {
+                first
                     .command_line
                     .get(line.len()..)
                     .unwrap_or_default()
@@ -81,6 +81,10 @@ impl Hinter for CwdAwareHinter {
 
     fn next_hint_token(&self) -> String {
         get_first_token(&self.current_hint)
+    }
+
+    fn continues_text_before_cursor(&self) -> bool {
+        true
     }
 }
 

@@ -39,30 +39,34 @@ impl Keybindings {
 
     /// Adds a keybinding
     ///
-    /// # Panics
-    ///
-    /// If `command` is an empty [`ReedlineEvent::UntilFound`]
+    /// An empty [`ReedlineEvent::UntilFound`] is accepted; it never matches
+    /// anything and behaves like an unbound key.
     pub fn add_binding(
         &mut self,
         modifier: KeyModifiers,
         key_code: KeyCode,
         command: ReedlineEvent,
     ) {
-        if let ReedlineEvent::UntilFound(subcommands) = &command {
-            assert!(
-                !subcommands.is_empty(),
-                "UntilFound should contain a series of potential events to handle"
-            );
-        }
-
         let key_combo = KeyCombination { modifier, key_code };
         self.bindings.insert(key_combo, command);
     }
 
-    /// Find a keybinding based on the modifier and keycode
+    /// Find a keybinding based on the modifier and keycode.
+    ///
+    /// If a shifted non-character key is unbound, try again without Shift.
     pub fn find_binding(&self, modifier: KeyModifiers, key_code: KeyCode) -> Option<ReedlineEvent> {
-        let key_combo = KeyCombination { modifier, key_code };
-        self.bindings.get(&key_combo).cloned()
+        let mut key_combo = KeyCombination { modifier, key_code };
+        self.bindings
+            .get(&key_combo)
+            .or_else(|| {
+                if modifier.contains(KeyModifiers::SHIFT) && !matches!(key_code, KeyCode::Char(_)) {
+                    key_combo.modifier.remove(KeyModifiers::SHIFT);
+                    self.bindings.get(&key_combo)
+                } else {
+                    None
+                }
+            })
+            .cloned()
     }
 
     /// Remove a keybinding
@@ -207,6 +211,76 @@ pub fn add_common_navigation_bindings(kb: &mut Keybindings) {
     kb.add_binding(KM::SHIFT | KM::ALT, KC::Char('.'), ReedlineEvent::ToEnd);
 }
 
+/// Rebind the navigation set for a mode that holds a selection open (vi
+/// visual, helix select), on top of [`add_common_navigation_bindings`].
+///
+/// Each key extends like the modal motion it stands for instead of moving,
+/// which would drop the selection and start a new one. Up/Down never reach
+/// menus or history, since history traversal would replace the buffer the
+/// selection is anchored in, and no key accepts a history hint, since that
+/// inserts text.
+///
+/// `left` and `right` are the grapheme steps, passed in since the two
+/// machines lower `h`/`l` to different commands and a key should equal its
+/// own twin. `Backspace` follows `left`, as it follows `h` in normal.
+pub(crate) fn add_extending_navigation_bindings(
+    kb: &mut Keybindings,
+    left: EditCommand,
+    right: EditCommand,
+) {
+    use crate::{Direction as D, MotionTarget as MT, WordEdge, WordKind};
+    use KeyCode as KC;
+    use KeyModifiers as KM;
+
+    let extend = |target: MT| edit_bind(EditCommand::Extend(target));
+
+    // `h`/`l` by grapheme, with Backspace following `h`.
+    kb.add_binding(KM::NONE, KC::Left, edit_bind(left.clone()));
+    kb.add_binding(KM::NONE, KC::Right, edit_bind(right));
+    kb.add_binding(KM::NONE, KC::Backspace, edit_bind(left));
+    let word = |direction: D| MT::Word {
+        kind: WordKind::Word,
+        edge: WordEdge::Start,
+        direction,
+    };
+    let line_up = || edit_bind(EditCommand::MoveLineUp { select: true });
+    let line_down = || edit_bind(EditCommand::MoveLineDown { select: true });
+
+    // `k`/`j` by line, with the emacs-style aliases following them.
+    kb.add_binding(KM::NONE, KC::Up, line_up());
+    kb.add_binding(KM::NONE, KC::Down, line_down());
+    kb.add_binding(KM::CONTROL, KC::Char('p'), line_up());
+    kb.add_binding(KM::CONTROL, KC::Char('n'), line_down());
+    // Word chords, the `b`/`w` twins.
+    kb.add_binding(KM::CONTROL, KC::Left, extend(word(D::Backward)));
+    kb.add_binding(KM::CONTROL, KC::Right, extend(word(D::Forward)));
+    // Line edges on Home/End and their emacs aliases.
+    kb.add_binding(KM::NONE, KC::Home, extend(MT::LineEdge(D::Backward)));
+    kb.add_binding(KM::NONE, KC::End, extend(MT::LineEdge(D::Forward)));
+    kb.add_binding(
+        KM::CONTROL,
+        KC::Char('a'),
+        extend(MT::LineEdge(D::Backward)),
+    );
+    kb.add_binding(KM::CONTROL, KC::Char('e'), extend(MT::LineEdge(D::Forward)));
+    // Buffer edges on Ctrl-Home/End and the Alt-</> jumps.
+    kb.add_binding(KM::CONTROL, KC::Home, extend(MT::BufferEdge(D::Backward)));
+    kb.add_binding(KM::CONTROL, KC::End, extend(MT::BufferEdge(D::Forward)));
+    kb.add_binding(KM::ALT, KC::Char('<'), extend(MT::BufferEdge(D::Backward)));
+    kb.add_binding(KM::ALT, KC::Char('>'), extend(MT::BufferEdge(D::Forward)));
+    // The kitty keyboard protocol spellings of Alt-</>.
+    kb.add_binding(
+        KM::SHIFT | KM::ALT,
+        KC::Char(','),
+        extend(MT::BufferEdge(D::Backward)),
+    );
+    kb.add_binding(
+        KM::SHIFT | KM::ALT,
+        KC::Char('.'),
+        extend(MT::BufferEdge(D::Forward)),
+    );
+}
+
 /// Add basic functionality to edit
 ///
 /// `Delete`, `Backspace` and the basic variants do delete words
@@ -242,6 +316,26 @@ pub fn add_common_edit_bindings(kb: &mut Keybindings) {
     kb.add_binding(KM::ALT, KC::Enter, edit_bind(EC::InsertNewline));
     kb.add_binding(KM::SHIFT, KC::Enter, edit_bind(EC::InsertNewline));
     kb.add_binding(KM::CONTROL, KC::Char('j'), ReedlineEvent::Enter);
+    // GNU quoted-insert: C-v (and C-q in emacs) read the next key
+    // literally instead of dispatching it.
+    kb.add_binding(KM::CONTROL, KC::Char('v'), ReedlineEvent::QuotedInsert);
+    kb.add_binding(KM::CONTROL, KC::Char('q'), ReedlineEvent::QuotedInsert);
+    // GNU delete-horizontal-space on M-\.
+    kb.add_binding(
+        KM::ALT,
+        KC::Char('\\'),
+        edit_bind(EC::DeleteHorizontalSpace),
+    );
+    // GNU overwrite-mode on the Insert key.
+    kb.add_binding(KM::NONE, KC::Insert, ReedlineEvent::OverwriteMode(None));
+    // GNU tab-insert M-C-i (Alt+Tab): insert a literal tab.
+    kb.add_binding(KM::ALT, KC::Tab, edit_bind(EC::InsertChar('\t')));
+    // GNU clear-display M-C-l: full repaint incl. scrollback.
+    kb.add_binding(
+        KM::ALT | KM::CONTROL,
+        KC::Char('l'),
+        ReedlineEvent::ClearScrollback,
+    );
 }
 
 pub fn add_common_selection_bindings(kb: &mut Keybindings) {
@@ -304,4 +398,110 @@ pub fn add_common_selection_bindings(kb: &mut Keybindings) {
         KC::Char('a'),
         edit_bind(EC::SelectAll),
     );
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[rstest::rstest]
+    #[case(KeyModifiers::NONE, KeyCode::Backspace, EditCommand::Backspace)]
+    #[case(KeyModifiers::NONE, KeyCode::Delete, EditCommand::Delete)]
+    #[case(KeyModifiers::CONTROL, KeyCode::Backspace, EditCommand::BackspaceWord)]
+    fn shifted_deletion_keys_work_in_insert_modes(
+        #[case] modifier: KeyModifiers,
+        #[case] key_code: KeyCode,
+        #[case] command: EditCommand,
+    ) {
+        use crate::{EditMode, Emacs, ReedlineRawEvent, Vi};
+        use crossterm::event::{Event, KeyEvent};
+
+        let key = || {
+            ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                key_code,
+                modifier | KeyModifiers::SHIFT,
+            )))
+            .unwrap()
+        };
+        let expected = edit_bind(command);
+        assert_eq!(Emacs::default().parse_event(key()), expected);
+        assert_eq!(Vi::default().parse_event(key()), expected);
+    }
+
+    #[rstest::rstest]
+    #[case(KeyModifiers::NONE, KeyCode::Backspace, true)]
+    #[case(KeyModifiers::NONE, KeyCode::Delete, true)]
+    #[case(KeyModifiers::CONTROL, KeyCode::Backspace, true)]
+    #[case(KeyModifiers::ALT, KeyCode::Enter, true)]
+    #[case(KeyModifiers::CONTROL | KeyModifiers::ALT, KeyCode::F(1), true)]
+    #[case(KeyModifiers::NONE, KeyCode::Char('x'), false)]
+    #[case(KeyModifiers::CONTROL, KeyCode::Char('x'), false)]
+    fn shift_fallback_preserves_modifiers_and_explicit_bindings(
+        #[case] modifier: KeyModifiers,
+        #[case] key_code: KeyCode,
+        #[case] falls_back: bool,
+    ) {
+        let mut kb = Keybindings::new();
+        let shifted = modifier | KeyModifiers::SHIFT;
+        assert_eq!(kb.find_binding(shifted, key_code), None);
+
+        kb.add_binding(modifier, key_code, ReedlineEvent::Enter);
+        assert_eq!(
+            kb.find_binding(shifted, key_code),
+            falls_back.then_some(ReedlineEvent::Enter)
+        );
+
+        kb.add_binding(shifted, key_code, ReedlineEvent::Esc);
+        assert_eq!(kb.find_binding(shifted, key_code), Some(ReedlineEvent::Esc));
+    }
+
+    #[test]
+    fn empty_until_found_is_accepted() {
+        let mut kb = Keybindings::new();
+        kb.add_binding(
+            KeyModifiers::NONE,
+            KeyCode::Char('x'),
+            ReedlineEvent::UntilFound(vec![]),
+        );
+        assert_eq!(
+            kb.find_binding(KeyModifiers::NONE, KeyCode::Char('x')),
+            Some(ReedlineEvent::UntilFound(vec![]))
+        );
+    }
+
+    #[test]
+    fn rebinding_a_key_replaces_the_previous_event() {
+        let mut kb = Keybindings::new();
+        kb.add_binding(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('r'),
+            ReedlineEvent::SearchHistory,
+        );
+        kb.add_binding(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('r'),
+            ReedlineEvent::ClearScreen,
+        );
+        assert_eq!(
+            kb.find_binding(KeyModifiers::CONTROL, KeyCode::Char('r')),
+            Some(ReedlineEvent::ClearScreen)
+        );
+        assert_eq!(kb.get_keybindings().len(), 1);
+    }
+
+    #[test]
+    fn remove_binding_returns_the_bound_event_and_unbinds() {
+        let mut kb = Keybindings::new();
+        kb.add_binding(
+            KeyModifiers::NONE,
+            KeyCode::Tab,
+            ReedlineEvent::Menu("m".into()),
+        );
+        assert_eq!(
+            kb.remove_binding(KeyModifiers::NONE, KeyCode::Tab),
+            Some(ReedlineEvent::Menu("m".into()))
+        );
+        assert_eq!(kb.find_binding(KeyModifiers::NONE, KeyCode::Tab), None);
+        assert_eq!(kb.remove_binding(KeyModifiers::NONE, KeyCode::Tab), None);
+    }
 }

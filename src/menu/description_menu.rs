@@ -1,8 +1,8 @@
 use {
     super::MenuSettings,
     crate::{
-        menu_functions::{completer_input, replace_in_buffer},
-        Completer, Editor, Menu, MenuBuilder, MenuEvent, Painter, Suggestion,
+        menu_functions::{escape_suggestions, replace_in_buffer, resolve_completer_input},
+        Completer, Editor, Menu, MenuBuilder, MenuEvent, Painter, Suggestion, Suggestions,
     },
     nu_ansi_term::ansi::RESET,
 };
@@ -62,7 +62,7 @@ pub struct DescriptionMenu {
     /// Working column details keep changing based on the collected values
     working_details: WorkingDetails,
     /// Menu cached values
-    values: Vec<Suggestion>,
+    values: Suggestions,
     /// column position of the cursor. Starts from 0
     col_pos: u16,
     /// row position in the menu. Starts from 0
@@ -92,7 +92,7 @@ impl Default for DescriptionMenu {
             default_details: DefaultMenuDetails::default(),
             min_rows: 3,
             working_details: WorkingDetails::default(),
-            values: Vec::new(),
+            values: Suggestions::default(),
             col_pos: 0,
             row_pos: 0,
             event: None,
@@ -217,7 +217,7 @@ impl DescriptionMenu {
         }
 
         let rows = values / self.get_cols();
-        if values % self.get_cols() != 0 {
+        if !values.is_multiple_of(self.get_cols()) {
             rows + 1
         } else {
             rows
@@ -227,13 +227,6 @@ impl DescriptionMenu {
     /// Returns working details col width
     fn get_width(&self) -> usize {
         self.working_details.col_width
-    }
-
-    /// Reset menu position
-    fn reset_position(&mut self) {
-        self.col_pos = 0;
-        self.row_pos = 0;
-        self.skipped_rows = 0;
     }
 
     fn no_records_msg(&self, use_ansi_coloring: bool) -> String {
@@ -426,36 +419,42 @@ impl Menu for DescriptionMenu {
         false
     }
 
-    /// Selects what type of event happened with the menu
-    fn menu_event(&mut self, event: MenuEvent) {
-        match &event {
-            MenuEvent::Activate(_) => self.active = true,
-            MenuEvent::Deactivate => {
-                self.active = false;
-                self.input = None;
-                self.values = Vec::new();
-            }
-            _ => {}
-        };
+    fn set_active(&mut self, active: bool) {
+        self.active = active;
+    }
 
+    fn clear_input(&mut self) {
+        self.input = None;
+    }
+
+    fn on_deactivate(&mut self) {
+        self.values = Suggestions::default();
+    }
+
+    /// Handle menu event
+    fn menu_event(&mut self, event: MenuEvent) {
+        self.handle_menu_event(&event);
         self.event = Some(event);
     }
 
     /// Updates menu values
+    fn reset_position(&mut self) {
+        self.col_pos = 0;
+        self.row_pos = 0;
+        self.skipped_rows = 0;
+    }
+
     fn update_values(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
-        if self.settings.only_buffer_difference && self.input.is_none() {
-            self.input = Some(editor.get_buffer().to_string());
+        let (input, pos) = resolve_completer_input(editor, &mut self.input, &self.settings);
+
+        // `into_shared` yields `None` for a `Pending` result (a background
+        // completion is still in flight with nothing to show yet), so we keep the
+        // current suggestions and selection rather than blanking the menu. A
+        // settled result hands over its shared `Arc` without copying.
+        if let Some(values) = completer.complete(&input, pos).into_shared() {
+            self.values = escape_suggestions(values);
+            self.reset_position();
         }
-
-        let (input, pos) = completer_input(
-            editor.get_buffer(),
-            editor.insertion_point(),
-            self.input.as_deref(),
-            self.settings.only_buffer_difference,
-        );
-        self.values = completer.complete(&input, pos);
-
-        self.reset_position();
     }
 
     /// The working details for the menu changes based on the size of the lines
@@ -547,17 +546,15 @@ impl Menu for DescriptionMenu {
             let default_width = if let Some(col_width) = self.default_details.col_width {
                 col_width
             } else {
-                let col_width = painter.screen_width() / self.default_details.columns;
+                // Floored: `with_columns(0)` is representable.
+                let col_width = painter.screen_width() / self.default_details.columns.max(1);
                 col_width as usize
             };
 
             // Adjusting the working width of the column based the max line width found
-            // in the menu values
-            if max_width > default_width {
-                self.working_details.col_width = max_width;
-            } else {
-                self.working_details.col_width = default_width;
-            };
+            // in the menu values. Floored: both can be 0 on a 0-width
+            // terminal, and `possible_cols` divides by this.
+            self.working_details.col_width = max_width.max(default_width).max(1);
 
             // The working columns is adjusted based on possible number of columns
             // that could be fitted in the screen with the calculated column width
@@ -586,14 +583,10 @@ impl Menu for DescriptionMenu {
     /// The buffer gets replaced in the Span location
     fn replace_in_buffer(&self, editor: &mut Editor) {
         if let Some(mut suggestion) = self.get_value() {
-            if let Some(example_index) = self.example_index {
-                let example = self
-                    .examples
-                    .get(example_index)
-                    .expect("the example index is always checked");
+            if let Some(example) = self.example_index.and_then(|i| self.examples.get(i)) {
                 suggestion.value.clone_from(example);
             }
-            replace_in_buffer(Some(suggestion), editor);
+            replace_in_buffer(Some(suggestion), editor, self.settings.output_mode);
         }
     }
 
@@ -668,5 +661,65 @@ impl Menu for DescriptionMenu {
                 self.create_example_string(use_ansi_coloring)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::painting::{Painter, W};
+    use crate::{Span, Suggestion};
+
+    struct FakeCompleter {
+        completions: Vec<String>,
+    }
+
+    impl Completer for FakeCompleter {
+        fn complete(&mut self, _line: &str, pos: usize) -> crate::CompletionResult {
+            crate::CompletionResult::fresh(
+                self.completions
+                    .iter()
+                    .map(|c| Suggestion {
+                        value: c.to_string(),
+                        span: Span { start: 0, end: pos },
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }
+
+    fn setup_menu(menu: &mut DescriptionMenu, terminal_size: (u16, u16)) {
+        let mut editor = Editor::default();
+        let mut completer = FakeCompleter {
+            completions: ["alpha", "beta", "gamma"].map(String::from).to_vec(),
+        };
+        let mut painter = Painter::new(W::sink());
+        painter.handle_resize(terminal_size.0, terminal_size.1);
+        menu.menu_event(MenuEvent::Activate(false));
+        menu.update_working_details(&mut editor, &mut completer, &painter);
+    }
+
+    /// `with_columns(0)` reaches the layout's screen-width division.
+    #[test]
+    fn zero_configured_columns_does_not_panic_the_layout() {
+        let mut menu = DescriptionMenu::default().with_columns(0);
+        setup_menu(&mut menu, (30, 10));
+        assert!(!menu.menu_string(10, false).is_empty());
+    }
+
+    /// Empty suggestions on a 0-width terminal zero both width candidates,
+    /// and `possible_cols` divides by their max.
+    #[test]
+    fn zero_width_terminal_does_not_panic_the_layout() {
+        let mut menu = DescriptionMenu::default();
+        let mut editor = Editor::default();
+        let mut completer = FakeCompleter {
+            completions: vec![],
+        };
+        let mut painter = Painter::new(W::sink());
+        painter.handle_resize(0, 0);
+        menu.menu_event(MenuEvent::Activate(false));
+        menu.update_working_details(&mut editor, &mut completer, &painter);
     }
 }
