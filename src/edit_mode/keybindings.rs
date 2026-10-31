@@ -326,6 +326,16 @@ pub fn add_common_edit_bindings(kb: &mut Keybindings) {
         KC::Char('\\'),
         edit_bind(EC::DeleteHorizontalSpace),
     );
+    // GNU overwrite-mode on the Insert key.
+    kb.add_binding(KM::NONE, KC::Insert, ReedlineEvent::OverwriteMode(None));
+    // GNU tab-insert M-C-i (Alt+Tab): insert a literal tab.
+    kb.add_binding(KM::ALT, KC::Tab, edit_bind(EC::InsertChar('\t')));
+    // GNU clear-display M-C-l: full repaint incl. scrollback.
+    kb.add_binding(
+        KM::ALT | KM::CONTROL,
+        KC::Char('l'),
+        ReedlineEvent::ClearScrollback,
+    );
 }
 
 pub fn add_common_selection_bindings(kb: &mut Keybindings) {
