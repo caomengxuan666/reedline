@@ -42,9 +42,10 @@ pub fn default_emacs_keybindings() -> Keybindings {
             ReedlineEvent::Right,
         ]),
     );
-    // Undo/Redo
+    // Undo/Redo. GNU binds C-z to suspend (signals.c rl_stop) and undo
+    // to C-_ — Undo stays available there.
     kb.add_binding(KM::CONTROL, KC::Char('g'), edit_bind(EC::Redo));
-    kb.add_binding(KM::CONTROL, KC::Char('z'), edit_bind(EC::Undo));
+    kb.add_binding(KM::CONTROL, KC::Char('z'), ReedlineEvent::Suspend);
     // GNU revert-line (undo.c:331): M-r and M-C-r undo every change to
     // the current line (emacs_keymap.c:445 and :336 respectively).
     kb.add_binding(KM::ALT, KC::Char('r'), edit_bind(EC::RevertLine));

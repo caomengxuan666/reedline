@@ -75,5 +75,12 @@ pub fn default_vi_insert_keybindings() -> Keybindings {
     add_common_edit_bindings(&mut kb);
     add_common_selection_bindings(&mut kb);
 
+    // GNU vi-insert binds C-z to suspend too (vi_keymap.c).
+    kb.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Char('z'),
+        ReedlineEvent::Suspend,
+    );
+
     kb
 }
