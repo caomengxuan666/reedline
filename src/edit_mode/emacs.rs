@@ -42,8 +42,12 @@ pub fn default_emacs_keybindings() -> Keybindings {
             ReedlineEvent::Right,
         ]),
     );
-    // Undo/Redo. GNU binds C-z to suspend (signals.c rl_stop) and undo
-    // to C-_ — Undo stays available there.
+    // Undo/Redo. GNU's emacs keymap leaves C-z unbound — the tty
+    // driver's VSUSP char sends SIGTSTP to the foreground pgrp before
+    // readline sees the byte (signals.c rl_stop handles the caught
+    // signal). With ISIG off there is no VSUSP delivery, so we bind the
+    // suspend event directly to reproduce GNU's observable behavior.
+    // Undo stays on C-_, GNU's binding.
     kb.add_binding(KM::CONTROL, KC::Char('g'), edit_bind(EC::Redo));
     kb.add_binding(KM::CONTROL, KC::Char('z'), ReedlineEvent::Suspend);
     // GNU revert-line (undo.c:331): M-r and M-C-r undo every change to
