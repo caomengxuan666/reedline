@@ -31,6 +31,13 @@ pub struct LineBuffer {
     /// Single source of truth — the old `insertion_point` + `selection_anchor`
     /// pair collapsed into this.
     cursor: Cursor,
+    /// GNU `rl_mark` — the saved position `set-mark`
+    /// (text.c:1880 `_rl_set_mark_at_pos`) drops and
+    /// `exchange-point-and-mark`/`kill-region`/`copy-region-as-kill`
+    /// read. `None` is GNU's `rl_mark < 0` (unset). It is a byte
+    /// offset into `lines`, not part of the cursor: it survives
+    /// non-selecting cursor moves, which is what makes a region grow.
+    mark: Option<usize>,
 }
 
 impl From<&str> for LineBuffer {
@@ -146,6 +153,39 @@ impl LineBuffer {
     /// Clears any active selection. The cursor head is unchanged.
     pub fn clear_selection(&mut self) {
         self.cursor = Cursor::point(self.cursor.head());
+    }
+
+    /// The saved mark position — GNU `rl_mark` (text.c:1880). `None`
+    /// until [`set_mark`](Self::set_mark) drops it.
+    pub fn mark(&self) -> Option<usize> {
+        self.mark
+    }
+
+    /// `rl_mark = rl_point` (text.c:1876 `_rl_set_mark_at_pos`).
+    pub fn set_mark(&mut self) {
+        self.mark = Some(self.insertion_point());
+    }
+
+    /// `rl_mark = -1` — forget the mark.
+    pub fn clear_mark(&mut self) {
+        self.mark = None;
+    }
+
+    /// `rl_exchange_point_and_mark` (text.c:1885): swap point and
+    /// mark. Returns false — GNU's `rl_mark < 0` ding — when no mark
+    /// is set or the stored mark has drifted out of the buffer.
+    pub fn exchange_point_and_mark(&mut self) -> bool {
+        match self.mark {
+            Some(mark) if mark <= self.len() => {
+                self.mark = Some(self.insertion_point());
+                self.set_insertion_point(mark);
+                true
+            }
+            _ => {
+                self.mark = None;
+                false
+            }
+        }
     }
 
     /// Collapse any selection to a zero-width point at the **caret** — the
@@ -410,6 +450,7 @@ impl LineBuffer {
     pub fn clear(&mut self) {
         self.lines = String::new();
         self.set_head(0);
+        self.mark = None;
     }
 
     /// Clear everything beginning at the cursor to the right/end.

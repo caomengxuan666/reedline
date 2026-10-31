@@ -89,6 +89,12 @@ enum InputMode {
     /// Either bash style up/down history or fish style prefix search,
     /// Edits directly switch to [`InputMode::Regular`]
     HistoryTraversal,
+    /// GNU non-incremental history search (search.c `noninc_search` —
+    /// `RL_STATE_NSEARCH`): the line buffer collects the search string
+    /// in-place under a one-character prompt, `Enter` runs a single
+    /// search, `C-g` aborts and restores the saved line.
+    /// State lives in [`Reedline::noninc_search`].
+    NonIncrementalSearch,
 }
 
 /// Configuration for mouse click-to-cursor support.
@@ -170,6 +176,38 @@ struct HistoryLineSearch {
     /// the needle is `buffer[..point]` then, an anchored match lands
     /// the point back on it, and a failed search restores it.
     search_len: usize,
+}
+
+/// The live state of a [`InputMode::NonIncrementalSearch`] — GNU's
+/// `_rl_search_cxt` for `RL_SEARCH_NSEARCH` (search.c `_rl_nsearch_init`):
+/// the line swapped out while the buffer collects the search string
+/// (`_rl_saved_line_for_search`), the direction, the one-char prompt
+/// (`_rl_make_prompt_for_search`), and the `SF_PATTERN` flag.
+struct NonIncrementalSearchState {
+    /// The line as it was before the search string began collecting
+    /// (`_rl_saved_line_for_search`); restored on abort and before a
+    /// commit runs.
+    saved_buffer: String,
+    /// `cxt->save_point` — restored on abort/failure.
+    saved_insertion_point: usize,
+    /// The glyph GNU substitutes for the prompt (`_rl_make_prompt_for_search`):
+    /// `:` by default, `/`/`?` from vi command mode.
+    prompt_char: char,
+    /// Search direction — `Forward` toward newer entries, `Backward` older.
+    direction: Direction,
+    /// GNU `SF_PATTERN` (vi command mode): match with the
+    /// `_hs_history_patsearch` glob instead of a plain substring.
+    pattern: bool,
+    /// `cxt->save_line`/`cxt->history_pos` (search.c:240-241): the
+    /// history position when the search opened, where a commit on a
+    /// fresh string starts from (`noninc_history_pos = save_line`,
+    /// search.c:429).
+    save_line: Option<HistoryItemId>,
+    /// The vi mode the search was entered from — GNU reads the string
+    /// through the vi-*insertion* keymap in command mode
+    /// (`_rl_nsearch_init`, search.c:112) and restores the command
+    /// keymap in `_rl_nsearch_fini`. `None` outside vi normal.
+    saved_edit_mode: Option<PromptEditMode>,
 }
 
 /// Line editor engine
@@ -344,6 +382,20 @@ pub struct Reedline {
     // events continue one search (GNU's `rl_last_func` reinit checks,
     // search.c:701,737,755).
     history_line_search: Option<HistoryLineSearch>,
+
+    // Live `RL_STATE_NSEARCH` context — `Some` only in
+    // `InputMode::NonIncrementalSearch` (search.c `_rl_nscxt`).
+    noninc_search: Option<NonIncrementalSearchState>,
+
+    // The last string a non-incremental search committed (GNU's static
+    // `noninc_search_string`, search.c:60): an empty-string commit and
+    // the `-again` variants reuse it.
+    noninc_search_string: Option<String>,
+
+    // The history position `noninc_history_pos` (search.c:61): the
+    // entry a committed search last landed on, which `-again` repeats
+    // and an empty-string commit resume from. `None` is the live line.
+    noninc_search_pos: Option<HistoryItemId>,
 
     // Copies of the quoted character a pending numeric argument asked
     // for when `QuotedInsert` was dispatched — GNU passes its count to
@@ -643,6 +695,270 @@ fn burst_char(event: &Event) -> Option<char> {
 /// `Enter` is `\r`, `Tab` is `\t`, `Backspace` is DEL, `Esc` is ESC.
 /// Every other key is consumed with no insert — GNU reads exactly one
 /// input character and stops.
+/// `_hs_history_patsearch` (histsearch.c:245): whether `pat` matches
+/// `line` as a glob — `*`, `?`, `[...]` (with `!`/`^` negation and
+/// `-` ranges), `\` escaping the next char. Unanchored patterns get an
+/// implicit `*` on both ends, anchored (`^`-prefixed) ones only at the
+/// tail (histsearch.c:265-283). A trailing unescaped `\` rejects the
+/// pattern outright (histsearch.c:256-263).
+fn noninc_pat_search(pat: &str, line: &str, anchored: bool) -> bool {
+    let mut trailing = pat.len();
+    let mut unescaped = false;
+    while trailing > 0 && pat.as_bytes()[trailing - 1] == b'\\' {
+        unescaped = !unescaped;
+        trailing -= 1;
+    }
+    if unescaped {
+        return false;
+    }
+    let pat = if anchored {
+        format!("{pat}*")
+    } else {
+        format!("*{pat}*")
+    };
+    glob_match(&pat, line)
+}
+
+/// Small glob matcher for [`noninc_pat_search`] — `*`, `?`, `[...]`
+/// classes with leading `!`/`^` negation, `a-z` ranges, `\` quoting.
+/// Operates on chars, so multibyte text matches `?` per character.
+fn glob_match(pat: &str, text: &str) -> bool {
+    fn at(chars: &[char], i: usize) -> Option<char> {
+        chars.get(i).copied()
+    }
+    fn matches(p: &[char], t: &[char]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        match p[0] {
+            '*' => (0..=t.len()).any(|i| matches(&p[1..], &t[i..])),
+            '?' => !t.is_empty() && matches(&p[1..], &t[1..]),
+            '\\' => p.len() > 1 && t.first() == p.get(1) && matches(&p[2..], &t[1..]),
+            '[' => {
+                let Some(&c) = t.first() else { return false };
+                let (negate, mut i) = match at(p, 1) {
+                    Some('!') | Some('^') => (true, 2),
+                    _ => (false, 1),
+                };
+                // A leading `]` inside a class is a literal member.
+                let mut matched = false;
+                let mut first = true;
+                loop {
+                    match at(p, i) {
+                        Some(']') if !first => break,
+                        None => return false, // unclosed class: no match
+                        _ => {}
+                    }
+                    first = false;
+                    // `a-z` ranges; `\` escapes a class char.
+                    let lo = if at(p, i) == Some('\\') && at(p, i + 1).is_some() {
+                        i += 1;
+                        at(p, i)
+                    } else {
+                        at(p, i)
+                    };
+                    if at(p, i + 1) == Some('-') && at(p, i + 2).is_some_and(|hi| hi != ']') {
+                        let hi = at(p, i + 2).unwrap();
+                        if lo.is_some_and(|lo| lo <= c && c <= hi) {
+                            matched = true;
+                        }
+                        i += 3;
+                    } else {
+                        if lo == Some(c) {
+                            matched = true;
+                        }
+                        i += 1;
+                    }
+                }
+                if matched != negate {
+                    matches(&p[i + 1..], &t[1..])
+                } else {
+                    false
+                }
+            }
+            c => t.first() == Some(&c) && matches(&p[1..], &t[1..]),
+        }
+    }
+    matches(
+        &pat.chars().collect::<Vec<_>>(),
+        &text.chars().collect::<Vec<_>>(),
+    )
+}
+
+/// `history_tokenize` (histexpand.c:1692 → `history_tokenize_internal`
+/// :1638 + `history_tokenize_word` :1483): split a command line the
+/// way `!`-expansion sees words — `fielddelim` whitespace separates
+/// fields, `()<>;&|` form operator tokens (with `<<`/`<<-`/`<<<`/`>>`
+/// `&>`/`>&`/`|>`/`n>`/`>&n`/`<&n-` spellings), `"`/`'`/`` ` `` quote
+/// with `\` escapes, `$(...)`/`<(...)`/`>(...)` and `!`/`@`/`?`/`+`
+/// extended globs nest to their `)`. Quotes stay inside the tokens —
+/// `history_arg_extract` slices verbatim, so `yank-last-arg` on
+/// `echo "two words"` yanks `"two words"`.
+fn history_tokenize(string: &str) -> Vec<String> {
+    /// `fielddelim` (histexpand.c:58) — `whitespace` + `\n`.
+    fn fielddelim(c: u8) -> bool {
+        matches!(c, b' ' | b'\t' | b'\n' | b'\r')
+    }
+    const WORD_DELIMS: &[u8] = b" \t\n;&()|<>";
+    const QUOTES: &[u8] = b"\"'`";
+    let s = string.as_bytes();
+
+    /// `get_word` (histexpand.c:1536): scan a word starting at
+    /// `start`, honoring quotes, backslash escapes and `(...)` nests.
+    fn scan_word(s: &[u8], start: usize) -> usize {
+        let at = |i: usize| *s.get(i).unwrap_or(&0);
+        let mut i = start;
+        let mut delimiter = 0u8;
+        let mut nestdelim = 0i32;
+        let mut delimopen = 0u8;
+        if QUOTES.contains(&at(i)) {
+            delimiter = at(i);
+            i += 1;
+        }
+        while at(i) != 0 {
+            if at(i) == b'\\' && at(i + 1) == b'\n' {
+                i += 2;
+                continue;
+            }
+            // histexpand.c:1564: `\\` escapes outside `'...'`; inside
+            // `"..."` GNU tests `string[i]` — the backslash itself —
+            // against `slashify_in_quotes`, which is always true, so
+            // the escape is unconditional there too.
+            if at(i) == b'\\' && delimiter != b'\'' {
+                i += 1;
+                if at(i) == 0 {
+                    break;
+                }
+                i += 1;
+                continue;
+            }
+            if nestdelim > 0 && at(i) == delimopen {
+                nestdelim += 1;
+                i += 1;
+                continue;
+            }
+            if nestdelim > 0 && at(i) == delimiter {
+                nestdelim -= 1;
+                if nestdelim == 0 {
+                    delimiter = 0;
+                }
+                i += 1;
+                continue;
+            }
+            if delimiter != 0 && at(i) == delimiter {
+                delimiter = 0;
+                i += 1;
+                continue;
+            }
+            // Command/process substitution and extended globs
+            // (histexpand.c:1591): `<(`, `>(`, `$(`, `!(`, `@(`, `?(`,
+            // `+(` — GNU's set also has `*(` folded into `*`.
+            if nestdelim == 0
+                && delimiter == 0
+                && matches!(at(i), b'<' | b'>' | b'$' | b'!' | b'@' | b'?' | b'+' | b'*')
+                && at(i + 1) == b'('
+            {
+                i += 1;
+                if at(i + 1) == 0 {
+                    break;
+                }
+                delimopen = b'(';
+                delimiter = b')';
+                nestdelim = 1;
+                i += 1;
+                continue;
+            }
+            if delimiter == 0 && WORD_DELIMS.contains(&at(i)) {
+                break;
+            }
+            if delimiter == 0 && QUOTES.contains(&at(i)) {
+                delimiter = at(i);
+            }
+            i += 1;
+        }
+        i
+    }
+
+    /// `history_tokenize_word` (histexpand.c:1483): the token starting
+    /// at `start` — one word, an operator, or a lone `(`/`)`/`\n`.
+    fn tokenize_word(s: &[u8], start: usize) -> usize {
+        let at = |i: usize| *s.get(i).unwrap_or(&0);
+        let mut i = start;
+        if matches!(at(i), b'(' | b')' | b'\n') {
+            return i + 1;
+        }
+        if at(i).is_ascii_digit() {
+            let mut j = i;
+            while at(j).is_ascii_digit() {
+                j += 1;
+            }
+            if at(j) == 0 {
+                return j;
+            }
+            if at(j) == b'<' || at(j) == b'>' {
+                i = j; // digits are a file descriptor
+            } else {
+                return scan_word(s, j);
+            }
+        }
+        if matches!(at(i), b'<' | b'>' | b';' | b'&' | b'|') {
+            let peek = at(i + 1);
+            if peek == at(i) {
+                if peek == b'<' && matches!(at(i + 2), b'-' | b'<') {
+                    return i + 3; // `<<-`, `<<<`
+                }
+                return i + 2;
+            }
+            if peek == b'&' && matches!(at(i), b'>' | b'<') {
+                // `<&[digits][-]`, `>&[digits][-]`
+                let mut j = i + 2;
+                while at(j).is_ascii_digit() {
+                    j += 1;
+                }
+                if at(j) == b'-' {
+                    j += 1;
+                }
+                return j;
+            }
+            if (peek == b'>' && at(i) == b'&') || (peek == b'|' && at(i) == b'>') {
+                return i + 2; // `&>`, `>|`
+            }
+            if peek == b'(' && matches!(at(i), b'>' | b'<') {
+                return scan_word(s, i + 2); // process substitution
+            }
+            return i + 1;
+        }
+        scan_word(s, i)
+    }
+
+    let mut result = Vec::new();
+    let mut i = 0usize;
+    while i < s.len() {
+        while i < s.len() && fielddelim(s[i]) {
+            i += 1;
+        }
+        if i >= s.len() {
+            break;
+        }
+        // `history_comment_char` is `'\0'` here, GNU's unset default:
+        // the comment check can never fire (histexpand.c:1656).
+        let start = i;
+        i = tokenize_word(s, start);
+        if i == start {
+            // A delimiter the word scan refused (histexpand.c:1666):
+            // emit it plus its delimiter run as one token.
+            i += 1;
+            while i < s.len() && WORD_DELIMS.contains(&s[i]) {
+                i += 1;
+            }
+        }
+        if let Some(token) = string.get(start..i) {
+            result.push(token.to_string());
+        }
+    }
+    result
+}
+
 fn quoted_insert_char(event: &Event) -> Option<char> {
     if let Event::Key(KeyEvent {
         code,
@@ -759,6 +1075,9 @@ impl Reedline {
             pending_char_search: None,
             yank_last_arg: None,
             history_recall_pos: None,
+            noninc_search: None,
+            noninc_search_string: None,
+            noninc_search_pos: None,
             operate_and_get_next: None,
             history_line_search: None,
             replay_depth: 0,
@@ -1519,6 +1838,13 @@ impl Reedline {
         self.history_recall_pos = None;
         self.yank_last_arg = None;
         self.history_line_search = None;
+        // A read that ended mid-collection (host command, suspend)
+        // must not carry the string into the next line — GNU clears
+        // `RL_STATE_NSEARCH` on teardown.
+        self.noninc_search = None;
+        if self.input_mode == InputMode::NonIncrementalSearch {
+            self.input_mode = InputMode::Regular;
+        }
 
         self.suspended_state.take()
     }
@@ -2140,11 +2466,17 @@ impl Reedline {
                             if !self.pending_arg.is_some_and(|arg| arg.dispatch_next) =>
                         {
                             self.arg_digit(digit);
+                            // GNU's `(arg: N) ` shows while the
+                            // argument accumulates (misc.c
+                            // `_rl_arg_getchar`): a Repaint makes the
+                            // accumulation key itself paint it.
+                            reedline_events.push((ReedlineEvent::Repaint, self.replay_depth));
                         }
                         ReedlineEvent::UniversalArgument
                             if !self.pending_arg.is_some_and(|arg| arg.dispatch_next) =>
                         {
                             self.arg_universal();
+                            reedline_events.push((ReedlineEvent::Repaint, self.replay_depth));
                         }
                         // Macro controls are engine state, applied at
                         // parse time like QuotedInsert below — and ahead
@@ -2428,10 +2760,24 @@ impl Reedline {
                 self.arg_universal();
                 return Ok(EventStatus::Handled);
             }
+            ReedlineEvent::PrintLastKbdMacro => {
+                // `rl_print_last_kbd_macro` (macro.c:309): ding when no
+                // recording exists; otherwise print the keyseq spelling
+                // above the prompt like GNU's `rl_crlf` + `printf`.
+                if self.last_macro.is_empty() {
+                    return Ok(EventStatus::Inapplicable);
+                }
+                self.painter.print_external_message(vec![
+                    crate::edit_mode::key_sequence_spelling(&self.last_macro),
+                ])?;
+                return Ok(EventStatus::Handled);
+            }
             _ => {}
         }
         let status = if self.input_mode == InputMode::HistorySearch {
             self.handle_history_search_event(event)
+        } else if self.input_mode == InputMode::NonIncrementalSearch {
+            self.handle_noninc_search_event(prompt, event)
         } else {
             self.handle_editor_event(prompt, event)
         };
@@ -2577,6 +2923,9 @@ impl Reedline {
             | ReedlineEvent::UniversalArgument
             | ReedlineEvent::WithArg { .. }
             | ReedlineEvent::OverwriteMode(_)
+            | ReedlineEvent::NonIncrementalSearch { .. }
+            | ReedlineEvent::NonIncrementalSearchAgain { .. }
+            | ReedlineEvent::PrintLastKbdMacro
             | ReedlineEvent::Multiple(_)
             | ReedlineEvent::None
             | ReedlineEvent::HistoryHintWordComplete
@@ -2594,6 +2943,269 @@ impl Reedline {
             | ReedlineEvent::Suspend
             | ReedlineEvent::SwitchMode(_) => Ok(EventStatus::Inapplicable),
         }
+    }
+
+    /// The [`InputMode::NonIncrementalSearch`] machine — GNU's
+    /// `_rl_nsearch_dispatch` (search.c:295): the buffer is the search
+    /// string, `Enter` commits, `C-g`/`C-c`/`Esc` abort and restore,
+    /// `Backspace` on an empty buffer aborts, ordinary edits apply.
+    fn handle_noninc_search_event(
+        &mut self,
+        prompt: &dyn Prompt,
+        event: ReedlineEvent,
+    ) -> io::Result<EventStatus> {
+        match event {
+            ReedlineEvent::UntilFound(events) | ReedlineEvent::Multiple(events) => {
+                for event in events {
+                    match self.handle_noninc_search_event(prompt, event)? {
+                        EventStatus::Inapplicable => {}
+                        success => {
+                            return Ok(success);
+                        }
+                    }
+                }
+                Ok(EventStatus::Inapplicable)
+            }
+            ReedlineEvent::Enter | ReedlineEvent::Submit | ReedlineEvent::SubmitOrNewline => {
+                // `_rl_nsearch_dosearch` (search.c:398): take the buffer
+                // as the string, restore the saved line, then run the
+                // one search. An empty string reuses the last one from
+                // its last position (the `rl_point == 0` branch).
+                let Some(state) = self.noninc_search.take() else {
+                    self.input_mode = InputMode::Regular;
+                    return Ok(EventStatus::Handled);
+                };
+                let string = self.editor.get_buffer().to_string();
+                self.input_mode = InputMode::Regular;
+                let (string, from) = if string.is_empty() {
+                    match self.noninc_search_string.clone() {
+                        Some(saved) => (saved, self.noninc_search_pos),
+                        // No saved string — `_rl_unsave_saved_search_line`
+                        // + `rl_ding` (search.c:415-424).
+                        None => {
+                            self.restore_noninc_saved_line(state);
+                            return Ok(EventStatus::Inapplicable);
+                        }
+                    }
+                } else {
+                    self.noninc_search_string = Some(string.clone());
+                    (string, state.save_line)
+                };
+                let (direction, pattern) = (state.direction, state.pattern);
+                self.restore_noninc_saved_line(state);
+                self.noninc_dosearch(&string, direction, pattern, from)
+            }
+            ReedlineEvent::CtrlC | ReedlineEvent::Esc => {
+                // `_rl_nsearch_abort` (search.c:270): saved line and
+                // point back, prompt restored.
+                if let Some(state) = self.noninc_search.take() {
+                    self.restore_noninc_saved_line(state);
+                }
+                self.input_mode = InputMode::Regular;
+                Ok(EventStatus::Handled)
+            }
+            // `C-g` arrives bound to `Redo` in the emacs map; in GNU's
+            // dispatch (search.c:335) it is an abort key.
+            ReedlineEvent::Edit(commands) if commands == [EditCommand::Redo] => {
+                if let Some(state) = self.noninc_search.take() {
+                    self.restore_noninc_saved_line(state);
+                }
+                self.input_mode = InputMode::Regular;
+                Ok(EventStatus::Handled)
+            }
+            ReedlineEvent::Edit(commands) => {
+                // Rubout at `rl_point == 0` aborts (search.c:331).
+                if self.editor.insertion_point() == 0 && commands.contains(&EditCommand::Backspace)
+                {
+                    if let Some(state) = self.noninc_search.take() {
+                        self.restore_noninc_saved_line(state);
+                    }
+                    self.input_mode = InputMode::Regular;
+                    return Ok(EventStatus::Handled);
+                }
+                self.run_edit_commands(&commands);
+                Ok(EventStatus::Handled)
+            }
+            ReedlineEvent::QuotedInsert => {
+                self.quoted_insert = true;
+                Ok(EventStatus::Handled)
+            }
+            ReedlineEvent::CtrlD => {
+                // `C-d` exits only on an empty search string, like the
+                // isearch mode's `CtrlD` arm; with text it deletes.
+                if self.editor.is_empty() {
+                    if let Some(state) = self.noninc_search.take() {
+                        self.restore_noninc_saved_line(state);
+                    }
+                    self.input_mode = InputMode::Regular;
+                    Ok(EventStatus::Exits(Signal::CtrlD))
+                } else {
+                    self.run_edit_commands(&[EditCommand::Delete]);
+                    Ok(EventStatus::Handled)
+                }
+            }
+            ReedlineEvent::ExecuteHostCommand(host_command) => {
+                self.last_render_snapshot = None;
+                self.suspended_state = Some(self.painter.state_before_suspension());
+                Ok(EventStatus::Exits(Signal::HostCommand(host_command)))
+            }
+            ReedlineEvent::Resize(width, height) => {
+                self.last_render_snapshot = None;
+                self.painter.handle_resize(width, height);
+                Ok(EventStatus::Handled)
+            }
+            ReedlineEvent::Repaint => Ok(EventStatus::Handled),
+            ReedlineEvent::ClearScreen => {
+                self.painter.clear_screen()?;
+                Ok(EventStatus::Handled)
+            }
+            ReedlineEvent::ClearScrollback => {
+                self.painter.clear_scrollback()?;
+                Ok(EventStatus::Handled)
+            }
+            // Anything else GNU would read as a literal input byte has
+            // no reedline form; the event is ignored, as a key with no
+            // dispatch case is in `_rl_nsearch_dispatch`.
+            _ => Ok(EventStatus::Inapplicable),
+        }
+    }
+
+    /// `_rl_nsearch_init` (search.c:230): save the line, clear the
+    /// buffer to read the search string into it, swap the prompt for
+    /// the one-char `pchar`, set `RL_STATE_NSEARCH`.
+    fn enter_noninc_search(&mut self, direction: Direction, prompt_char: char, pattern: bool) {
+        self.noninc_search = Some(NonIncrementalSearchState {
+            saved_buffer: self.editor.get_buffer().to_string(),
+            saved_insertion_point: self.editor.insertion_point(),
+            prompt_char,
+            direction,
+            pattern,
+            save_line: self.history_recall_pos,
+            saved_edit_mode: None,
+        });
+        self.editor
+            .set_buffer(String::new(), UndoBehavior::CreateUndoPoint);
+        self.input_mode = InputMode::NonIncrementalSearch;
+        // Under vi command mode GNU reads the string through the
+        // vi-insertion keymap (`_rl_nsearch_init`, search.c:112), so
+        // typed characters insert rather than parse as commands. The
+        // saved mode comes back on the way out.
+        if let PromptEditMode::Vi(mode) = self.edit_mode.edit_mode() {
+            if mode != crate::PromptViMode::Insert {
+                self.noninc_search.as_mut().unwrap().saved_edit_mode =
+                    Some(PromptEditMode::Vi(mode));
+                self.change_edit_mode(ReedlineEvent::SwitchMode(PromptEditMode::Vi(
+                    crate::PromptViMode::Insert,
+                )));
+            }
+        }
+    }
+
+    /// `_rl_unsave_saved_search_line` (search.c:287 /
+    /// `_rl_nsearch_abort`): the line the search displaced is put back,
+    /// with its saved point.
+    fn restore_noninc_saved_line(&mut self, state: NonIncrementalSearchState) {
+        self.editor
+            .set_buffer(state.saved_buffer, UndoBehavior::CreateUndoPoint);
+        let point = state.saved_insertion_point;
+        self.editor.edit_buffer(
+            move |buf| buf.set_insertion_point(point.min(buf.len())),
+            UndoBehavior::MoveCursor,
+        );
+        self.editor.commit_cursor();
+        // `_rl_nsearch_fini`: the command-mode keymap comes back.
+        if let Some(mode) = state.saved_edit_mode {
+            self.change_edit_mode(ReedlineEvent::SwitchMode(mode));
+        }
+    }
+
+    /// `noninc_dosearch` (search.c:179): find `string` in history one
+    /// entry past `from` in `direction` — a leading `^` anchors the
+    /// match to the entry start (search.c:145-149), `pattern` switches
+    /// to GNU's `SF_PATTERN` glob (`_hs_history_patsearch`,
+    /// histsearch.c:245). On a hit the entry becomes the buffer with
+    /// the point at its start (`rl_point = 0`, `rl_mark = rl_end`,
+    /// search.c:214-219) and `noninc_history_pos` updates; on a miss
+    /// nothing changes (GNU leaves the line as restored and dings).
+    fn noninc_dosearch(
+        &mut self,
+        string: &str,
+        direction: Direction,
+        pattern: bool,
+        from: Option<HistoryItemId>,
+    ) -> io::Result<EventStatus> {
+        if string.is_empty() {
+            return Ok(EventStatus::Inapplicable);
+        }
+        // Forward from the live line has nowhere to go
+        // (`noninc_history_pos + 1` past the newest entry).
+        if direction == Direction::Forward && from.is_none() {
+            return Ok(EventStatus::Inapplicable);
+        }
+        let (anchored, needle) = match string.strip_prefix('^') {
+            Some(rest) => (true, rest),
+            None => (false, string),
+        };
+        let results = self.history.search(SearchQuery {
+            direction: match direction {
+                Direction::Backward => SearchDirection::Backward,
+                Direction::Forward => SearchDirection::Forward,
+            },
+            start_time: None,
+            end_time: None,
+            start_id: from,
+            end_id: None,
+            limit: None,
+            filter: SearchFilter::anything(self.get_history_session_id()),
+        })?;
+        let found = results.iter().find(|item| {
+            // `pos + dir` in GNU is strict — `Forward` here includes
+            // `from` itself, so skip it (the `-again` calls restart on
+            // the last hit, search.c:192).
+            if direction == Direction::Forward && item.id == from {
+                return false;
+            }
+            if pattern {
+                noninc_pat_search(needle, &item.command_line, anchored)
+            } else if anchored {
+                item.command_line.starts_with(needle)
+            } else {
+                item.command_line.contains(needle)
+            }
+        });
+        match found {
+            Some(item) => {
+                let item = item.clone();
+                self.noninc_search_pos = item.id;
+                self.history_recall_pos = item.id;
+                self.editor
+                    .set_buffer(item.command_line, UndoBehavior::HistoryNavigation);
+                // `rl_point = 0; rl_mark = rl_end` (search.c:217-219).
+                let len = self.editor.get_buffer().len();
+                self.editor.edit_buffer(
+                    move |buf| {
+                        buf.set_insertion_point(len);
+                        buf.set_mark();
+                        buf.set_insertion_point(0);
+                    },
+                    UndoBehavior::MoveCursor,
+                );
+                self.editor.commit_cursor();
+                Ok(EventStatus::Handled)
+            }
+            None => Ok(EventStatus::Inapplicable),
+        }
+    }
+
+    /// `rl_noninc_*_search_again` (search.c:517/:541): repeat the last
+    /// search with the saved string from `noninc_history_pos` — the vi
+    /// `n`/`N` path (`rl_vi_search_again`, vi_mode.c:348), which GNU
+    /// always runs under `SF_PATTERN`. Ding before the first search.
+    fn noninc_search_again(&mut self, direction: Direction) -> io::Result<EventStatus> {
+        let Some(string) = self.noninc_search_string.clone() else {
+            return Ok(EventStatus::Inapplicable);
+        };
+        self.noninc_dosearch(&string, direction, true, self.noninc_search_pos)
     }
 
     fn handle_editor_event(
@@ -2782,6 +3394,17 @@ impl Reedline {
                 direction,
                 anchored,
             } => self.history_search_line(direction, anchored),
+            ReedlineEvent::NonIncrementalSearch {
+                direction,
+                prompt_char,
+                pattern,
+            } => {
+                self.enter_noninc_search(direction, prompt_char, pattern);
+                Ok(EventStatus::Handled)
+            }
+            ReedlineEvent::NonIncrementalSearchAgain { direction } => {
+                self.noninc_search_again(direction)
+            }
             ReedlineEvent::OverwriteMode(on) => {
                 // GNU rl_overwrite_mode: arg>0 sets, arg<=0 clears,
                 // no arg toggles.
@@ -3096,6 +3719,7 @@ impl Reedline {
             | ReedlineEvent::DigitArgument(_)
             | ReedlineEvent::UniversalArgument
             | ReedlineEvent::Suspend
+            | ReedlineEvent::PrintLastKbdMacro
             | ReedlineEvent::WithArg { .. } => Ok(EventStatus::Inapplicable),
         }
     }
@@ -3361,11 +3985,13 @@ impl Reedline {
     /// the same indexing `history_arg_extract(first, last, string)`
     /// uses (histexpand.c:1424).
     ///
-    /// Caveat vs GNU: `history_arg_extract` tokenizes with full shell
-    /// quoting rules (`history_tokenize`); this uses a whitespace
-    /// split, so `"two words"` counts as two arguments, not one.
+    /// The tokens come from [`history_tokenize`], the port of GNU's
+    /// tokenizer (`history_tokenize`, histexpand.c:1692): quoting and
+    /// operators are honored, and tokens keep their quote characters —
+    /// `!$` on `echo "two words"` yanks `"two words"`.
     fn yank_history_arg(&mut self, entry: &HistoryItem, arg: Option<i32>) -> EventStatus {
-        let tokens: Vec<&str> = entry.command_line.split_whitespace().collect();
+        let tokens = history_tokenize(&entry.command_line);
+        let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
         let len = tokens.len() as i64;
         let index = match arg {
             // `'$'` is the last argument (kill.c:676 passes it through
@@ -4428,6 +5054,18 @@ impl Reedline {
                     lines.prompt_indicator = menu.indicator().to_owned().into();
                 }
             }
+        }
+
+        // GNU's `rl_message` overlays: while a non-incremental search
+        // reads its string the prompt becomes the one-char
+        // `_rl_make_prompt_for_search` indicator (search.c:235), and a
+        // pending numeric argument paints `(arg: N) `
+        // (`_rl_arg_getchar`, misc.c:103). Reedline paints the
+        // equivalent as an indicator swap rather than a message line.
+        if let Some(state) = self.noninc_search.as_ref() {
+            lines.prompt_indicator = state.prompt_char.to_string().into();
+        } else if let Some(arg) = self.pending_arg {
+            lines.prompt_indicator = format!("(arg: {}) ", arg.count()).into();
         }
 
         let menu = self.menus.iter().find(|menu| menu.is_visible());
@@ -11566,5 +12204,427 @@ mod tests {
         drive(&mut rl, &[alt('p')]);
         assert_eq!(rl.editor.get_buffer(), "ls! baz");
         assert_eq!(rl.editor.insertion_point(), 3);
+    }
+
+    // --- non-incremental history search (search.c:462 `noninc_search`) ---
+
+    /// A vi seam engine with the default three tables.
+    fn vi_engine() -> Reedline {
+        let mut rl = Reedline::create().with_edit_mode(Box::new(crate::Vi::new(
+            crate::default_vi_insert_keybindings(),
+            crate::default_vi_normal_keybindings(),
+            crate::default_vi_visual_keybindings(),
+        )));
+        rl.painter.force_prompt_anchored_for_test(0);
+        rl
+    }
+
+    #[test]
+    fn noninc_search_backward_finds_substring() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["echo one", "echo two", "ls three"]);
+        type_each(&mut rl, &[ch('w'), ch('o'), ch('r'), ch('k')]);
+
+        drive(&mut rl, &[alt('p')]);
+        type_each(
+            &mut rl,
+            &[ch('e'), ch('c'), ch('h'), ch('o'), key(KeyCode::Enter)],
+        );
+        assert_eq!(rl.editor.get_buffer(), "echo two");
+        // `rl_point = 0` on the found entry (search.c:215).
+        assert_eq!(rl.editor.insertion_point(), 0);
+    }
+
+    #[test]
+    fn noninc_search_forward_finds_newer_entry() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["echo one", "echo two", "ls three"]);
+
+        drive(&mut rl, &[alt('p')]);
+        type_each(&mut rl, &[ch('^'), ch('e'), key(KeyCode::Enter)]);
+        assert_eq!(rl.editor.get_buffer(), "echo two");
+
+        // M-n from the hit searches newer entries (noninc_history_pos
+        // + 1, search.c:192).
+        drive(&mut rl, &[alt('n')]);
+        type_each(&mut rl, &[ch('l'), ch('s'), key(KeyCode::Enter)]);
+        assert_eq!(rl.editor.get_buffer(), "ls three");
+    }
+
+    #[test]
+    fn noninc_search_anchor_requires_prefix() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["echo one"]);
+        type_each(&mut rl, &[ch('w'), ch('o'), ch('r'), ch('k')]);
+
+        drive(&mut rl, &[alt('p')]);
+        type_each(&mut rl, &[ch('^'), ch('o'), key(KeyCode::Enter)]);
+        // `^o` anchors: "echo one" has no leading `o` — a failed
+        // search restores the saved line (search.c:446+).
+        assert_eq!(rl.editor.get_buffer(), "work");
+    }
+
+    #[test]
+    fn noninc_search_empty_string_repeats_last() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["echo one", "echo two", "ls three"]);
+
+        drive(&mut rl, &[alt('p')]);
+        type_each(
+            &mut rl,
+            &[ch('e'), ch('c'), ch('h'), ch('o'), key(KeyCode::Enter)],
+        );
+        assert_eq!(rl.editor.get_buffer(), "echo two");
+
+        // Empty Enter reuses the saved string from its last position
+        // (search.c:412-425) — backward again lands on the older hit.
+        drive(&mut rl, &[alt('p'), key(KeyCode::Enter)]);
+        assert_eq!(rl.editor.get_buffer(), "echo one");
+    }
+
+    #[test]
+    fn noninc_search_abort_restores_line_and_point() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["echo one"]);
+        type_each(&mut rl, &[ch('w'), ch('o'), ch('r'), ch('k')]);
+        drive(&mut rl, &[ctrl('b')]);
+        assert_eq!(rl.editor.insertion_point(), 3);
+
+        drive(&mut rl, &[alt('p')]);
+        type_each(&mut rl, &[ch('e'), ch('c'), key(KeyCode::Esc)]);
+        assert_eq!(rl.editor.get_buffer(), "work");
+        assert_eq!(rl.editor.insertion_point(), 3);
+        assert_eq!(rl.input_mode, InputMode::Regular);
+    }
+
+    #[test]
+    fn noninc_search_backspace_on_empty_aborts() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('x'), ch('y')]);
+
+        drive(&mut rl, &[alt('p')]);
+        // Rubout at `rl_point == 0` is an abort (search.c:331).
+        drive(&mut rl, &[key(KeyCode::Backspace)]);
+        assert_eq!(rl.editor.get_buffer(), "xy");
+        assert_eq!(rl.input_mode, InputMode::Regular);
+    }
+
+    #[test]
+    fn noninc_search_collects_editable_string() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["echo one"]);
+
+        drive(&mut rl, &[alt('p')]);
+        // The buffer is the string being typed; it edits normally.
+        type_each(&mut rl, &[ch('z'), key(KeyCode::Backspace), ch('e')]);
+        assert_eq!(rl.editor.get_buffer(), "e");
+        drive(&mut rl, &[key(KeyCode::Enter)]);
+        assert_eq!(rl.editor.get_buffer(), "echo one");
+    }
+
+    #[test]
+    fn noninc_again_without_previous_search_dings() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        let status = rl
+            .handle_editor_event(
+                &DefaultPrompt::default(),
+                ReedlineEvent::NonIncrementalSearchAgain {
+                    direction: Direction::Backward,
+                },
+            )
+            .unwrap();
+        assert!(matches!(status, EventStatus::Inapplicable));
+    }
+
+    #[test]
+    fn vi_search_again_walks_matches() {
+        // `/`+`n`/`N` — `rl_vi_search`/`rl_vi_search_again`
+        // (vi_mode.c:348/:365), pattern matching on.
+        let mut rl = vi_engine();
+        seed_history(&mut rl, &["echo one", "echo two", "ls three"]);
+
+        type_each(
+            &mut rl,
+            &[
+                key(KeyCode::Esc),
+                ch('/'),
+                ch('e'),
+                ch('c'),
+                ch('h'),
+                ch('o'),
+                key(KeyCode::Enter),
+            ],
+        );
+        assert_eq!(rl.editor.get_buffer(), "echo two");
+        drive(&mut rl, &[ch('n')]);
+        assert_eq!(rl.editor.get_buffer(), "echo one");
+        // `N` — a shifted char so the vi parser sees the uppercase.
+        drive(
+            &mut rl,
+            &[KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)],
+        );
+        assert_eq!(rl.editor.get_buffer(), "echo two");
+    }
+
+    #[test]
+    fn vi_percent_matches_bracket() {
+        // `%` — `rl_vi_match` (vi_mode.c:1951).
+        let mut rl = vi_engine();
+        type_each(
+            &mut rl,
+            &[ch('('), ch('a'), ch(')'), ch('b'), key(KeyCode::Esc)],
+        );
+        // Cursor sits on `b` — not a bracket, so GNU scans forward:
+        // no bracket after `b`, and the scan only counts openers.
+        // `h` back to `)` first.
+        drive(&mut rl, &[ch('h'), ch('%')]);
+        assert_eq!(rl.editor.insertion_point(), 0);
+    }
+
+    #[test]
+    fn vi_percent_scans_forward_for_opener() {
+        let mut rl = vi_engine();
+        type_each(
+            &mut rl,
+            &[ch('x'), ch('('), ch('a'), ch(')'), key(KeyCode::Esc)],
+        );
+        // On `)` — a closer — match backward to `(`.
+        drive(&mut rl, &[ch('%')]);
+        assert_eq!(rl.editor.insertion_point(), 1);
+    }
+
+    #[test]
+    fn vi_d_percent_cuts_through_bracket() {
+        let mut rl = vi_engine();
+        type_each(
+            &mut rl,
+            &[
+                ch('('),
+                ch('a'),
+                ch('b'),
+                ch(')'),
+                ch('z'),
+                key(KeyCode::Esc),
+            ],
+        );
+        drive(&mut rl, &[ch('0'), ch('d'), ch('%')]);
+        assert_eq!(rl.editor.get_buffer(), "z");
+    }
+
+    #[test]
+    fn vi_column_moves_to_nth_character() {
+        // `|` — `rl_vi_column` (vi_mode.c:1053).
+        let mut rl = vi_engine();
+        type_each(
+            &mut rl,
+            &[
+                ch('a'),
+                ch('b'),
+                ch('c'),
+                ch('d'),
+                ch('e'),
+                key(KeyCode::Esc),
+            ],
+        );
+        drive(&mut rl, &[ch('3'), ch('|')]);
+        assert_eq!(rl.editor.insertion_point(), 2);
+        // Past the end → the line end (GNU `rl_end_of_line`).
+        drive(&mut rl, &[ch('9'), ch('|')]);
+        assert_eq!(rl.editor.insertion_point(), 4);
+    }
+
+    #[test]
+    fn vi_capital_u_reverts_line() {
+        // `U` — `rl_revert_line` (vi_keymap.c:129).
+        let mut rl = vi_engine();
+        type_each(
+            &mut rl,
+            &[
+                ch('a'),
+                ch('b'),
+                ch('c'),
+                key(KeyCode::Esc),
+                KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT),
+            ],
+        );
+        assert_eq!(rl.editor.get_buffer(), "");
+    }
+
+    #[test]
+    fn vi_underscore_yanks_last_arg() {
+        // `_` — `rl_vi_yank_arg` (vi_mode.c:326).
+        let mut rl = vi_engine();
+        seed_history(&mut rl, &["ls /tmp dir"]);
+        type_each(&mut rl, &[key(KeyCode::Esc), ch('_')]);
+        assert_eq!(rl.editor.get_buffer(), "dir");
+    }
+
+    #[test]
+    fn vi_count_underscore_yanks_nth_arg() {
+        // `3_` → `rl_yank_nth_arg(count - 1)` = arg 2 ("dir").
+        let mut rl = vi_engine();
+        seed_history(&mut rl, &["ls /tmp dir"]);
+        type_each(&mut rl, &[key(KeyCode::Esc), ch('3'), ch('_')]);
+        assert_eq!(rl.editor.get_buffer(), "dir");
+
+        // `2_` → arg 1 on a fresh line.
+        let mut rl = vi_engine();
+        seed_history(&mut rl, &["ls /tmp dir"]);
+        type_each(&mut rl, &[key(KeyCode::Esc), ch('2'), ch('_')]);
+        assert_eq!(rl.editor.get_buffer(), "/tmp");
+    }
+
+    // --- set-mark / exchange-point-and-mark / region (text.c:1880, kill.c:442) ---
+
+    #[test]
+    fn set_mark_and_exchange_point_roundtrip() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('a'), ch('b'), ch('c'), ch('d')]);
+        drive(&mut rl, &[ctrl('b'), ctrl('b')]);
+        // C-@ drops the mark at point (text.c:1880).
+        drive(&mut rl, &[ctrl(' ')]);
+        drive(&mut rl, &[ctrl('e')]);
+        assert_eq!(rl.editor.insertion_point(), 4);
+        // C-x C-x swaps point and mark (text.c:1885).
+        drive(&mut rl, &[ctrl('x'), ctrl('x')]);
+        assert_eq!(rl.editor.insertion_point(), 2);
+        // And swaps back — the mark holds the old point.
+        drive(&mut rl, &[ctrl('x'), ctrl('x')]);
+        assert_eq!(rl.editor.insertion_point(), 4);
+    }
+
+    #[test]
+    fn kill_region_feeds_kill_ring() {
+        // `kill-region` — `rl_kill_region` (kill.c:449): point lands on
+        // the region start, the killed text goes to the ring.
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('h'), ch('e'), ch('l'), ch('l'), ch('o')]);
+        drive(&mut rl, &[ctrl('a'), ctrl(' '), ctrl('e')]);
+        let status = rl
+            .handle_editor_event(
+                &DefaultPrompt::default(),
+                ReedlineEvent::Edit(vec![EditCommand::KillRegion]),
+            )
+            .unwrap();
+        assert!(matches!(status, EventStatus::Handled));
+        assert_eq!(rl.editor.get_buffer(), "");
+        assert_eq!(rl.editor.insertion_point(), 0);
+        drive(&mut rl, &[ctrl('y')]);
+        assert_eq!(rl.editor.get_buffer(), "hello");
+    }
+
+    #[test]
+    fn copy_region_as_kill_keeps_buffer() {
+        // `copy-region-as-kill` — `rl_copy_region_to_kill` (kill.c:442):
+        // the region lands in the ring but the buffer is untouched.
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('x'), ch('y'), ch('z')]);
+        drive(&mut rl, &[ctrl('a'), ctrl(' '), ctrl('e')]);
+        let status = rl
+            .handle_editor_event(
+                &DefaultPrompt::default(),
+                ReedlineEvent::Edit(vec![EditCommand::CopyRegionAsKill]),
+            )
+            .unwrap();
+        assert!(matches!(status, EventStatus::Handled));
+        assert_eq!(rl.editor.get_buffer(), "xyz");
+        assert_eq!(rl.editor.insertion_point(), 3);
+        drive(&mut rl, &[ctrl('y')]);
+        assert_eq!(rl.editor.get_buffer(), "xyzxyz");
+    }
+
+    #[test]
+    fn kill_region_without_mark_is_inapplicable() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('x')]);
+        let status = rl
+            .handle_editor_event(
+                &DefaultPrompt::default(),
+                ReedlineEvent::Edit(vec![EditCommand::KillRegion]),
+            )
+            .unwrap();
+        assert!(matches!(status, EventStatus::Inapplicable));
+    }
+
+    // --- print-last-kbd-macro (macro.c:309) ---
+
+    #[test]
+    fn print_last_kbd_macro_without_recording_dings() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        let status = rl
+            .handle_event(&DefaultPrompt::default(), ReedlineEvent::PrintLastKbdMacro)
+            .unwrap();
+        assert!(matches!(status, EventStatus::Inapplicable));
+    }
+
+    #[test]
+    fn key_sequence_spelling_uses_gnu_bind_forms() {
+        use crate::edit_mode::key_sequence_spelling;
+        use crate::KeyCombination;
+        let keys = vec![
+            KeyCombination {
+                modifier: KeyModifiers::CONTROL,
+                key_code: KeyCode::Char('x'),
+            },
+            KeyCombination {
+                modifier: KeyModifiers::ALT,
+                key_code: KeyCode::Char('y'),
+            },
+            KeyCombination {
+                modifier: KeyModifiers::NONE,
+                key_code: KeyCode::Char('a'),
+            },
+            KeyCombination {
+                modifier: KeyModifiers::NONE,
+                key_code: KeyCode::Enter,
+            },
+            KeyCombination {
+                modifier: KeyModifiers::NONE,
+                key_code: KeyCode::Backspace,
+            },
+        ];
+        assert_eq!(key_sequence_spelling(&keys), "\\C-x\\M-ya^M^?");
+    }
+
+    // --- insert-comment (text.c:1384 `rl_insert_comment`) ---
+
+    #[test]
+    fn meta_hash_comments_out_and_submits() {
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        type_each(&mut rl, &[ch('f'), ch('o'), ch('o')]);
+        let signal = drive_until_signal(&mut rl, &[alt('#')]);
+        assert!(matches!(signal, Some(Signal::Success(ref s)) if s == "# foo"));
+    }
+
+    // --- quote-aware argument tokenization (histexpand.c:1638) ---
+
+    #[test]
+    fn history_tokenize_splits_like_gnu() {
+        // `history_tokenize` keeps quotes in the tokens and treats
+        // `|`, `()` etc. as operator tokens (histexpand.c:1483-1692).
+        assert_eq!(
+            history_tokenize("cmd a \"b c\" 'd e' f\\ g"),
+            vec!["cmd", "a", "\"b c\"", "'d e'", "f\\ g"]
+        );
+        assert_eq!(
+            history_tokenize("a | b; (c)"),
+            vec!["a", "|", "b", ";", "(", "c", ")"]
+        );
+        assert_eq!(
+            history_tokenize("git commit -m \"two words\""),
+            vec!["git", "commit", "-m", "\"two words\""]
+        );
+        // `'"'` — a double quote inside single quotes is literal.
+        assert_eq!(history_tokenize("echo '\"'"), vec!["echo", "'\"'"]);
+    }
+
+    #[test]
+    fn yank_last_arg_respects_shell_quotes() {
+        // `!$` on `echo "two words"` is `"two words"` — one argument
+        // under `history_arg_extract`, not two words.
+        let mut rl = seam_engine(Box::<Emacs>::default());
+        seed_history(&mut rl, &["echo \"two words\""]);
+        drive(&mut rl, &[alt('.')]);
+        assert_eq!(rl.editor.get_buffer(), "\"two words\"");
     }
 }

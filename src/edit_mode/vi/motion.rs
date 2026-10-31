@@ -107,6 +107,18 @@ where
                 None => ParseResult::Incomplete,
             }
         }
+        // vi `%` — GNU `rl_vi_match` (vi_mode.c:1951): match the
+        // bracket under the cursor, or scan forward to the first one.
+        Some('%') => {
+            let _ = input.next();
+            ParseResult::Valid(Motion::MatchBrackets)
+        }
+        // vi `|` — GNU `rl_vi_column` (vi_mode.c:1053): move to the
+        // count-th character of the buffer.
+        Some('|') => {
+            let _ = input.next();
+            ParseResult::Valid(Motion::Column)
+        }
         Some(';') => {
             let _ = input.next();
             ParseResult::Valid(Motion::ReplayCharSearch)
@@ -163,6 +175,12 @@ pub enum Motion {
     LeftBefore(char),
     ReplayCharSearch,
     ReverseCharSearch,
+    /// vi `%` — resolves to `MotionTarget::MatchingBracket`.
+    MatchBrackets,
+    /// vi `|` — resolves to `MotionTarget::Column(count)`; the count is
+    /// only known at [`ParsedViSequence`](super::parser::ParsedViSequence)
+    /// level, so the parser lowers it.
+    Column,
 }
 
 impl Motion {
@@ -237,6 +255,7 @@ impl Motion {
             }),
             Motion::FirstLine => Some(MotionTarget::BufferEdge(Direction::Backward)),
             Motion::LastLine => Some(MotionTarget::BufferEdge(Direction::Forward)),
+            Motion::MatchBrackets => Some(MotionTarget::MatchingBracket),
 
             // `j`/`k` — the adjacent line, for the operator path only (see the
             // method docs; the bare-motion arms lower to events instead).
@@ -312,6 +331,20 @@ impl Motion {
                 };
                 vec![ReedlineOption::Edit(edit)]
             }
+            Motion::MatchBrackets => {
+                let target = MotionTarget::MatchingBracket;
+                let edit = if select_mode {
+                    EditCommand::Extend(target)
+                } else {
+                    EditCommand::Move(target)
+                };
+                vec![ReedlineOption::Edit(edit)]
+            }
+            // The column depends on the multiplier, which only
+            // `ParsedViSequence::to_reedline_event` sees — unreachable
+            // through the bare `to_reedline` path, which is why that
+            // site handles it rather than this arm producing a stub.
+            Motion::Column => vec![],
             Motion::Line => vec![], // Placeholder as unusable standalone motion
             Motion::NonBlankStart => {
                 vec![ReedlineOption::Edit(EditCommand::MoveToLineNonBlankStart {

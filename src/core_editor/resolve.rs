@@ -147,6 +147,107 @@ pub(crate) fn resolve_motion(
             let inclusive = hit.is_some() && direction == Direction::Forward;
             span(hit.unwrap_or(origin), inclusive)
         }
+        // vi `%` — GNU `rl_vi_match` (vi_mode.c:1951). A miss is a no-op
+        // like the `Find` miss above (exclusive, so `d%` can't eat a
+        // grapheme on a ding); a hit is inclusive — `d%` eats the
+        // bracket it lands on, as in vim.
+        MotionTarget::MatchingBracket => {
+            let hit = match_bracket(buf, origin);
+            span(hit.unwrap_or(origin), hit.is_some())
+        }
+        // vi `|` — GNU `rl_vi_column` (vi_mode.c:1053): `rl_point = 0`,
+        // then `count - 1` characters forward, counting newlines as
+        // characters (GNU's `|` walks the buffer, not the screen
+        // line). A count past the buffer end lands at the current
+        // line's end — GNU's `rl_end_of_line` branch (vi_mode.c:1057).
+        MotionTarget::Column(n) => {
+            let mut head = 0usize;
+            let mut remaining = n.saturating_sub(1);
+            while remaining > 0 && head < buf.len() {
+                head = next_grapheme_boundary(buf, head);
+                remaining -= 1;
+            }
+            if remaining > 0 {
+                head = line::end_of_line(buf, origin);
+            }
+            span(head, false)
+        }
+    }
+}
+
+/// `rl_vi_bracktype` (vi_mode.c:1926): the `()[]{}` pairs, signed —
+/// positive for openers, the negated tag for closers. `<>` is not a vi
+/// pair.
+fn bracktype(c: char) -> i32 {
+    match c {
+        '(' => 1,
+        ')' => -1,
+        '[' => 2,
+        ']' => -2,
+        '{' => 3,
+        '}' => -3,
+        _ => 0,
+    }
+}
+
+/// `rl_vi_match` (vi_mode.c:1951): the byte offset of the bracket
+/// matching the one at `origin`. When `origin` is not on a bracket,
+/// GNU scans forward to the first bracket in the buffer and only an
+/// *opener* counts — reaching the end or a closer first dings
+/// (`brack <= 0`, vi_mode.c:1970).
+fn match_bracket(buf: &str, origin: usize) -> Option<usize> {
+    let char_at = |pos: usize| buf.get(pos..).and_then(|s| s.chars().next());
+    let mut pos = origin;
+    let mut brack = char_at(pos).map_or(0, bracktype);
+    if brack == 0 {
+        while brack == 0 && pos < buf.len() {
+            pos = next_grapheme_boundary(buf, pos);
+            brack = char_at(pos).map_or(0, bracktype);
+        }
+        if brack <= 0 {
+            return None;
+        }
+    }
+
+    // Scan out counting the same pair's nesting: the bracket itself
+    // opens the count, another of its kind deepens it, its mate
+    // closes it. Landing on a depth of 0 is the match; running off
+    // the buffer dings (GNU's `pos < 0` / `pos >= rl_end` branches).
+    let mut depth = 0i32;
+    if brack < 0 {
+        let mut p = pos;
+        loop {
+            let b = char_at(p).map_or(0, bracktype);
+            if b == brack {
+                depth += 1;
+            } else if b == -brack {
+                depth -= 1;
+            }
+            if depth == 0 {
+                return Some(p);
+            }
+            if p == 0 {
+                return None;
+            }
+            p = prev_grapheme_boundary(buf, p);
+        }
+    } else {
+        let mut p = pos;
+        loop {
+            let b = char_at(p).map_or(0, bracktype);
+            if b == brack {
+                depth += 1;
+            } else if b == -brack {
+                depth -= 1;
+            }
+            if depth == 0 {
+                return Some(p);
+            }
+            if p >= buf.len() {
+                return None;
+            }
+            p = next_grapheme_boundary(buf, p);
+        }
     }
 }
 

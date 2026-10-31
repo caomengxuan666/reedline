@@ -418,6 +418,23 @@ impl Editor {
             EditCommand::SwapCursorAndAnchor => self
                 .line_buffer
                 .set_cursor(self.line_buffer.cursor().flip()),
+            EditCommand::SetMark => {
+                // `_rl_set_mark_at_pos` (text.c:1880): `rl_mark = rl_point`.
+                self.line_buffer.set_mark();
+            }
+            EditCommand::ExchangePointAndMark => {
+                // `rl_exchange_point_and_mark` (text.c:1885): a stale
+                // or unset mark dings and is forgotten.
+                if !self.line_buffer.exchange_point_and_mark() {
+                    status = EditCommandStatus::Inapplicable;
+                }
+            }
+            EditCommand::KillRegion => {
+                status = self.region_kill(true);
+            }
+            EditCommand::CopyRegionAsKill => {
+                status = self.region_kill(false);
+            }
             #[cfg(feature = "system_clipboard")]
             EditCommand::CutSelectionSystem => self.cut_selection_to_system(),
             #[cfg(feature = "system_clipboard")]
@@ -614,6 +631,30 @@ impl Editor {
         let append = range.start >= self.line_buffer.insertion_point();
         let text = self.line_buffer.get_buffer()[range].to_string();
         self.push_kill(&text, granularity, append);
+    }
+
+    /// `region_kill_internal` + `rl_kill_region`/`rl_copy_region_to_kill`
+    /// (kill.c:415-455): the region is `min(point, mark)..max(point, mark)`.
+    /// `delete` selects GNU's kill-region over copy-region-as-kill; a kill
+    /// leaves the point at the region start (GNU's `npoint`), a copy leaves
+    /// it alone. Unset mark or an empty region dings (`rl_mark == rl_point`
+    /// → `rl_ding` in `region_kill_internal`).
+    fn region_kill(&mut self, delete: bool) -> EditCommandStatus {
+        let mark = match self.line_buffer.mark() {
+            Some(mark) if mark <= self.line_buffer.len() => mark,
+            _ => return EditCommandStatus::Inapplicable,
+        };
+        let point = self.insertion_point();
+        if mark == point {
+            return EditCommandStatus::Inapplicable;
+        }
+        let range = mark.min(point)..mark.max(point);
+        self.kill_range_to_ring(range.clone(), Granularity::CharWise);
+        if delete {
+            self.line_buffer.clear_range_safe(range.clone());
+            self.line_buffer.set_insertion_point(range.start);
+        }
+        EditCommandStatus::Applied
     }
 
     /// Plant or clear a selection anchor explicitly — retained only for test
