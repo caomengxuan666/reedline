@@ -320,6 +320,12 @@ pub fn add_common_edit_bindings(kb: &mut Keybindings) {
     // literally instead of dispatching it.
     kb.add_binding(KM::CONTROL, KC::Char('v'), ReedlineEvent::QuotedInsert);
     kb.add_binding(KM::CONTROL, KC::Char('q'), ReedlineEvent::QuotedInsert);
+    // GNU delete-horizontal-space on M-\.
+    kb.add_binding(
+        KM::ALT,
+        KC::Char('\\'),
+        edit_bind(EC::DeleteHorizontalSpace),
+    );
 }
 
 pub fn add_common_selection_bindings(kb: &mut Keybindings) {

@@ -632,6 +632,24 @@ impl LineBuffer {
         self.set_head(left_word_index);
     }
 
+    /// Deletes all whitespace around the insertion point (readline
+    /// `delete-horizontal-space`, `M-\`): everything after the previous
+    /// non-whitespace char through the next one. Newlines count as
+    /// whitespace in GNU (the function joins across line boundaries).
+    pub fn delete_horizontal_space(&mut self) {
+        let point = self.insertion_point();
+        let buffer = self.get_buffer();
+        let left = buffer[..point]
+            .rfind(|c: char| !c.is_whitespace())
+            .map(|idx| idx + buffer[idx..].chars().next().map_or(1, |c| c.len_utf8()))
+            .unwrap_or(0);
+        let right = buffer[point..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|offset| point + offset)
+            .unwrap_or(buffer.len());
+        self.clear_range(left..right);
+    }
+
     /// Deletes one word to the right
     pub fn delete_word_right(&mut self) {
         let right_word_index =

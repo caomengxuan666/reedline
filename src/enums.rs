@@ -668,6 +668,10 @@ pub enum EditCommand {
     /// Swap the current word with the word to the right
     SwapWords,
 
+    /// Deletes all whitespace around the insertion point (readline
+    /// `delete-horizontal-space`, `M-\`).
+    DeleteHorizontalSpace,
+
     /// Swap the current grapheme/character with the one to the right
     SwapGraphemes,
 
@@ -921,6 +925,7 @@ impl EditCommand {
             | EditCommand::ReplaceChars(_, _)
             | EditCommand::BackspaceWord
             | EditCommand::DeleteWord
+            | EditCommand::DeleteHorizontalSpace
             | EditCommand::Clear
             | EditCommand::ClearToLineEnd
             | EditCommand::Complete

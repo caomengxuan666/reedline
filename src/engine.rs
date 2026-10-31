@@ -4862,6 +4862,27 @@ mod tests {
         assert_eq!(rl.editor.get_buffer(), "z\u{2}x");
     }
 
+    /// M-\ delete-horizontal-space: kills whitespace around the point.
+    #[test]
+    fn delete_horizontal_space_kills_whitespace_around_point() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        drive(
+            &mut rl,
+            &[ch('a'), ch(' '), ch(' '), ch(' '), ch('b'), ch('c')],
+        );
+        // Move back onto the run of spaces, then M-\.
+        drive(
+            &mut rl,
+            &[
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+            ],
+        );
+        assert_eq!(rl.editor.get_buffer(), "abc");
+    }
+
     #[test]
     fn test_current_selection() {
         let mut rl = seam_engine(Box::<crate::Emacs>::default());

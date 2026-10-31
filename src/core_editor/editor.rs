@@ -285,6 +285,7 @@ impl Editor {
             EditCommand::CutCharLeft => self.cut_char_left(),
             EditCommand::BackspaceWord => self.line_buffer.delete_word_left(),
             EditCommand::DeleteWord => self.line_buffer.delete_word_right(),
+            EditCommand::DeleteHorizontalSpace => self.line_buffer.delete_horizontal_space(),
             EditCommand::Clear => self.line_buffer.clear(),
             EditCommand::ClearToLineEnd => self.line_buffer.clear_to_line_end(),
             EditCommand::CutCurrentLine => self.cut_current_line(),
