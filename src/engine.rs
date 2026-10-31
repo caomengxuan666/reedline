@@ -275,6 +275,13 @@ pub struct Reedline {
     // readline.c rl_quoted_insert — one input character verbatim).
     quoted_insert: bool,
 
+    // Set when the event currently being dispatched ran at least one
+    // `EditCommand` (which carries its own kill-ring bookkeeping inside
+    // `Editor::run_edit_command`). `handle_event` consults it afterward:
+    // a handled event that ran no edit still clears the editor's
+    // `_rl_last_command_was_kill`/`rl_last_func` records (readline.c:715-716).
+    edit_dispatched: bool,
+
     // Nesting depth of the event currently being handled — set from the
     // pending_input tag for replayed keys, 0 for live input. A
     // KeySequence handled at depth d enqueues at d+1.
@@ -609,6 +616,7 @@ impl Reedline {
             pending_input: VecDeque::new(),
             event_replay_depths: VecDeque::new(),
             quoted_insert: false,
+            edit_dispatched: false,
             replay_depth: 0,
             break_signal: None,
             repaint_signal: None,
@@ -1890,11 +1898,24 @@ impl Reedline {
             self.enqueue_replayed_keys(keys, self.replay_depth + 1);
             return Ok(EventStatus::Handled);
         }
-        if self.input_mode == InputMode::HistorySearch {
+        self.edit_dispatched = false;
+        let status = if self.input_mode == InputMode::HistorySearch {
             self.handle_history_search_event(event)
         } else {
             self.handle_editor_event(prompt, event)
+        };
+        // readline.c:715-716: the charloop clears `_rl_last_command_was_kill`
+        // after every dispatched command that didn't rearm it. An `Edit`
+        // batch arms the bookkeeping itself inside `Editor::run_edit_command`;
+        // a handled event that ran no `EditCommand` never reaches the editor,
+        // so its kill-chain and `rl_last_func` records are broken here —
+        // GNU invalidates `M-y` on any intervening command, not only edits.
+        if !self.edit_dispatched
+            && matches!(status, Ok(EventStatus::Handled | EventStatus::Exits(_)))
+        {
+            self.editor.note_non_edit_dispatch();
         }
+        status
     }
 
     fn handle_history_search_event(&mut self, event: ReedlineEvent) -> io::Result<EventStatus> {
@@ -2809,6 +2830,14 @@ impl Reedline {
         // Run every command, but report the edit as applied if any command applied.
         // This mirrors `Multiple`, where any handled event wins.
         let mut status = EditCommandStatus::Inapplicable;
+
+        // The editor's kill-ring bookkeeping (`_rl_last_command_was_kill`,
+        // `rl_last_func`) updates per command inside `run_edit_command`;
+        // record that this dispatch did reach it so `handle_event` doesn't
+        // clear the records afterward.
+        if !commands.is_empty() {
+            self.edit_dispatched = true;
+        }
 
         for command in commands {
             if let Some(command) = self.auto_pair_command(command) {
@@ -9824,5 +9853,212 @@ mod tests {
         assert!(envs.contains(&(OsStr::new("REEDLINE_TEST_DROP"), None)));
 
         assert_eq!(command_into_string(actual), expected);
+    }
+
+    // === GNU kill ring + yank-pop (kill.c, readline.c:715-716) ===
+
+    /// Type a string one `ch` event at a time, each its own batch.
+    fn type_str(rl: &mut Reedline, s: &str) {
+        type_each(rl, &s.chars().map(ch).collect::<Vec<_>>());
+    }
+
+    /// `rl_yank` (kill.c:509): C-y inserts the ring's current slot — the
+    /// newest kill — at the caret.
+    #[test]
+    fn yank_inserts_newest_kill() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "one two");
+        drive(&mut rl, &[ctrl('w')]);
+        assert_eq!(rl.editor.get_buffer(), "one ");
+        drive(&mut rl, &[ctrl('y')]);
+        assert_eq!(rl.editor.get_buffer(), "one two");
+    }
+
+    /// `_rl_copy_to_kill_ring` (kill.c:131-142): consecutive backward kills
+    /// prepend into the newest slot rather than taking their own.
+    #[test]
+    fn consecutive_backward_kills_merge_prepending() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "one two");
+        drive(&mut rl, &[ctrl('w'), ctrl('w')]);
+        // "two" then "one " — merged into one slot, prepended.
+        assert_eq!(rl.editor.get_buffer(), "");
+        assert_eq!(rl.editor.current_kill(), ("one two".to_string(), 1));
+        // …and the merged kill yanks back whole.
+        drive(&mut rl, &[ctrl('y')]);
+        assert_eq!(rl.editor.get_buffer(), "one two");
+    }
+
+    /// A backward kill followed by a forward kill merges the same way —
+    /// `from < to` appends after the old text (kill.c:146-148).
+    #[test]
+    fn backward_then_forward_kill_merge_around_point() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "foo bar");
+        drive(
+            &mut rl,
+            &[key(KeyCode::Left), key(KeyCode::Left), key(KeyCode::Left)],
+        );
+        // Caret between the words: C-w kills "foo " backward, M-d kills
+        // "bar" forward — one slot, "foo bar".
+        drive(&mut rl, &[ctrl('w'), alt('d')]);
+        assert_eq!(rl.editor.get_buffer(), "");
+        assert_eq!(rl.editor.current_kill(), ("foo bar".to_string(), 1));
+    }
+
+    /// A dispatched non-kill edit command clears
+    /// `_rl_last_command_was_kill` (readline.c:715-716) — the next kill
+    /// takes a fresh slot.
+    #[test]
+    fn motion_breaks_kill_merge_chain() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "one two");
+        drive(&mut rl, &[ctrl('w'), key(KeyCode::Left), ctrl('w')]);
+        assert_eq!(rl.editor.current_kill(), ("one".to_string(), 2));
+    }
+
+    /// A handled event that ran no `EditCommand` still counts as a
+    /// dispatched command in GNU — Esc between two kills breaks the chain
+    /// just like a motion does.
+    #[test]
+    fn non_edit_event_breaks_kill_merge_chain() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "one two");
+        drive(&mut rl, &[ctrl('w'), key(KeyCode::Esc), ctrl('w')]);
+        assert_eq!(rl.editor.current_kill(), ("one ".to_string(), 2));
+    }
+
+    /// Kills separated by non-kill commands stack up as separate slots —
+    /// the ring keeps them in kill order, newest last.
+    #[test]
+    fn separated_kills_stack_newest_last() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        for word in ["one", "two", "three"] {
+            type_str(&mut rl, word);
+            drive(&mut rl, &[ctrl('w')]);
+        }
+        assert_eq!(rl.editor.current_kill(), ("three".to_string(), 3));
+    }
+
+    /// `rl_yank_pop` (kill.c:527-556): M-y after a yank swaps the inserted
+    /// text for the next-older slot, cycling, and wraps past the oldest
+    /// slot back to the newest.
+    #[test]
+    fn yank_pop_cycles_and_wraps_the_ring() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        for word in ["aaa", "bbb", "ccc"] {
+            type_str(&mut rl, word);
+            drive(&mut rl, &[ctrl('w')]);
+        }
+        drive(&mut rl, &[ctrl('y')]);
+        assert_eq!(rl.editor.get_buffer(), "ccc");
+        drive(&mut rl, &[alt('y')]);
+        assert_eq!(rl.editor.get_buffer(), "bbb");
+        drive(&mut rl, &[alt('y')]);
+        assert_eq!(rl.editor.get_buffer(), "aaa");
+        drive(&mut rl, &[alt('y')]);
+        assert_eq!(rl.editor.get_buffer(), "ccc");
+    }
+
+    /// `rl_yank_pop` verifies the last yanked text literally precedes
+    /// point (STREQN, kill.c:538-542): an intervening edit invalidates
+    /// the pop and it dings — here, does nothing.
+    #[test]
+    fn yank_pop_dings_after_intervening_edit() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        for word in ["aaa", "bbb"] {
+            type_str(&mut rl, word);
+            drive(&mut rl, &[ctrl('w')]);
+        }
+        drive(&mut rl, &[ctrl('y')]);
+        assert_eq!(rl.editor.get_buffer(), "bbb");
+        type_str(&mut rl, "x");
+        drive(&mut rl, &[alt('y')]);
+        assert_eq!(rl.editor.get_buffer(), "bbbx");
+    }
+
+    /// The `rl_last_func` gate (kill.c:531): `YankPop` applies only
+    /// directly after `Yank`/`YankPop` — a handled non-edit event
+    /// overwrites the record too.
+    #[test]
+    fn yank_pop_dings_after_non_edit_event() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        for word in ["aaa", "bbb"] {
+            type_str(&mut rl, word);
+            drive(&mut rl, &[ctrl('w')]);
+        }
+        drive(&mut rl, &[ctrl('y')]);
+        assert_eq!(rl.editor.get_buffer(), "bbb");
+        drive(&mut rl, &[key(KeyCode::Esc)]);
+        drive(&mut rl, &[alt('y')]);
+        assert_eq!(rl.editor.get_buffer(), "bbb");
+    }
+
+    /// M-y with no preceding yank at all is likewise a ding.
+    #[test]
+    fn yank_pop_without_yank_is_inapplicable() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "aaa");
+        drive(&mut rl, &[ctrl('w'), alt('y')]);
+        assert_eq!(rl.editor.get_buffer(), "");
+    }
+
+    /// `rl_unix_filename_rubout` (kill.c:338-397): one pathname component
+    /// backward — the component, then a component plus its `/` run.
+    #[test]
+    fn filename_rubout_kills_one_component() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "foo/bar/baz");
+        rl.run_edit_commands(&[EditCommand::CutFilenameLeft]);
+        assert_eq!(rl.editor.get_buffer(), "foo/bar/");
+        assert_eq!(rl.editor.current_kill().0, "baz");
+        rl.run_edit_commands(&[EditCommand::CutFilenameLeft]);
+        assert_eq!(rl.editor.get_buffer(), "foo/");
+        // Consecutive kills merge — a backward kill prepends.
+        assert_eq!(rl.editor.current_kill(), ("bar/baz".to_string(), 1));
+    }
+
+    /// A `/` run that follows only whitespace (or the buffer start) is
+    /// taken wholesale — `rl_point = i + whitespace (c)` (kill.c:372).
+    #[test]
+    fn filename_rubout_takes_slash_runs_after_whitespace() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "a /");
+        rl.run_edit_commands(&[EditCommand::CutFilenameLeft]);
+        assert_eq!(rl.editor.get_buffer(), "a ");
+
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "  //x");
+        rl.run_edit_commands(&[EditCommand::CutFilenameLeft]);
+        assert_eq!(rl.editor.get_buffer(), "  //");
+        rl.run_edit_commands(&[EditCommand::CutFilenameLeft]);
+        assert_eq!(rl.editor.get_buffer(), "  ");
+    }
+
+    /// `_rl_copy_word_as_kill` (kill.c:460-506): `copy-forward-word` feeds
+    /// the ring without moving point or deleting anything.
+    #[test]
+    fn copy_forward_word_feeds_ring_without_deleting() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        type_str(&mut rl, "foo bar");
+        drive(&mut rl, &[ctrl('a')]);
+        rl.run_edit_commands(&[EditCommand::CopyWordRight]);
+        assert_eq!(rl.editor.get_buffer(), "foo bar");
+        assert_eq!(rl.editor.current_kill().0, "foo");
+    }
+
+    /// kill.c:131 — `rl_editing_mode == vi_mode` suppresses the merge: a
+    /// consecutive vi kill replaces the newest slot outright instead of
+    /// merging or pushing.
+    #[test]
+    fn vi_kills_replace_slot_instead_of_merging() {
+        let mut rl = seam_engine(Box::<crate::Vi>::default());
+        // vi starts in insert; Esc into normal, then `x` twice — each a
+        // kill into the ring.
+        type_str(&mut rl, "ab");
+        drive(&mut rl, &[key(KeyCode::Esc)]);
+        drive(&mut rl, &[ch('x'), ch('x')]);
+        assert_eq!(rl.editor.get_buffer(), "");
+        assert_eq!(rl.editor.current_kill(), ("a".to_string(), 1));
     }
 }

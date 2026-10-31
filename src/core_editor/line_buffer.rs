@@ -624,12 +624,86 @@ impl LineBuffer {
         }
     }
 
+    /// Cursor position at the start of the word to the left — the boundary
+    /// [`delete_word_left`](Self::delete_word_left) deletes to, exposed so
+    /// the kill-ring path (`unix-word-rubout`, `backward-kill-word`) can
+    /// capture the killed text before clearing it.
+    pub(crate) fn word_left_index(&self) -> usize {
+        self.word_boundary(WordKind::Unicode, WordEdge::Start, Direction::Backward)
+    }
+
     /// Deletes one word to the left
     pub fn delete_word_left(&mut self) {
         let left_word_index =
             self.word_boundary(WordKind::Unicode, WordEdge::Start, Direction::Backward);
         self.clear_range(left_word_index..self.insertion_point());
         self.set_head(left_word_index);
+    }
+
+    /// Byte index one filename component to the left of the insertion point
+    /// — GNU `rl_unix_filename_rubout` (kill.c:338-397): back over
+    /// whitespace, then a `/` run (a run preceded only by whitespace or the
+    /// buffer start retreats to its own start), then one non-`/`
+    /// non-whitespace component. `whitespace` is GNU's chardefs.h macro:
+    /// space or tab only.
+    ///
+    /// Walks character boundaries rather than bytes, so a multibyte
+    /// component can't split mid-UTF-8 the way the C version can
+    /// (`XXX - multibyte?`, kill.c:390).
+    pub fn filename_component_left_index(&self) -> usize {
+        let buf = self.get_buffer();
+        let whitespace = |c: char| matches!(c, ' ' | '\t');
+        let left = |pos: usize| self.grapheme_left_index_from_pos(pos);
+        let char_left = |pos: usize| buf[..pos].chars().next_back();
+
+        let mut point = self.insertion_point();
+        let Some(mut c) = char_left(point) else {
+            return point;
+        };
+
+        // First move backwards through whitespace.
+        while point > 0 && whitespace(c) {
+            point = left(point);
+            if let Some(prev) = char_left(point) {
+                c = prev;
+            }
+        }
+
+        // Consume one or more slashes.
+        if c == '/' {
+            // `i` lands on the first non-`/` char left of the run, or 0 when
+            // the run reaches the buffer start — GNU's `while (i > 0 &&
+            // c == '/') c = buf[--i]` scan.
+            let mut i = left(point);
+            while i > 0 && buf[i..].starts_with('/') {
+                i = left(i);
+            }
+            let before = buf[i..].chars().next();
+            if i == 0 || before.is_some_and(whitespace) {
+                // slashes only: the retreat ends just past the whitespace
+                // (`rl_point = i + whitespace (c)`, kill.c:372), or at 0.
+                return i + before.map_or(0, |c| usize::from(whitespace(c)) * c.len_utf8());
+            }
+            c = '/';
+        }
+
+        // Move backwards over the slash run and any whitespace before it.
+        while point > 0 && (whitespace(c) || c == '/') {
+            point = left(point);
+            if let Some(prev) = char_left(point) {
+                c = prev;
+            }
+        }
+
+        // Move backwards over the component itself.
+        while point > 0 && !whitespace(c) && c != '/' {
+            point = left(point);
+            if let Some(prev) = char_left(point) {
+                c = prev;
+            }
+        }
+
+        point
     }
 
     /// Deletes all whitespace around the insertion point (readline

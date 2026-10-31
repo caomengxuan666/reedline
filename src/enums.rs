@@ -649,6 +649,28 @@ pub enum EditCommand {
         count: usize,
     },
 
+    /// Insert the kill ring's current slot at the caret — GNU `rl_yank`
+    /// (kill.c:509-525), bound to `C-y` in the emacs keymap
+    /// (emacs_keymap.c). The pre-insert caret is where GNU drops the mark
+    /// (`_rl_set_mark_at_pos`); the inserted text is what a following
+    /// [`YankPop`](EditCommand::YankPop) rewrites.
+    Yank,
+
+    /// Cycle the just-yanked text back to the next-older kill-ring slot —
+    /// GNU `rl_yank_pop` (`M-y`, kill.c:527-556). Applicable only directly
+    /// after [`Yank`](EditCommand::Yank) or another `YankPop`
+    /// (`rl_last_func`), and only while the last yanked text still
+    /// literally precedes the caret (`STREQN`); any intervening command
+    /// makes it inapplicable.
+    YankPop,
+
+    /// Kill one filename component backward into the kill ring — GNU
+    /// `rl_unix_filename_rubout` (kill.c:338-397): back over whitespace,
+    /// then a `/` run, then a non-`/` non-whitespace component. GNU leaves
+    /// it unbound in the emacs keymap; it is exposed here for custom
+    /// bindings.
+    CutFilenameLeft,
+
     /// Upper case the current word
     UppercaseWord,
 
@@ -946,6 +968,9 @@ impl EditCommand {
             | EditCommand::CutBigWordRightToNext
             | EditCommand::PasteCutBufferBefore
             | EditCommand::PasteCutBufferAfter
+            | EditCommand::Yank
+            | EditCommand::YankPop
+            | EditCommand::CutFilenameLeft
             | EditCommand::UppercaseWord
             | EditCommand::LowercaseWord
             | EditCommand::CapitalizeWord
@@ -1013,6 +1038,78 @@ impl EditCommand {
             EditCommand::Copy { .. } => EditType::NoOp,
             EditCommand::Change { .. } => EditType::EditText,
             EditCommand::Erase(_) => EditType::EditText,
+        }
+    }
+
+    /// Whether executing this command can feed the kill ring — the
+    /// `_rl_last_command_was_kill` bookkeeping of readline.c's charloop
+    /// (readline.c:588,711-716): only a kill-class command re-arms the flag
+    /// that lets the *next* kill merge into the newest slot
+    /// (`_rl_copy_to_kill_ring`, kill.c:90); every other command clears it.
+    /// Both cuts and copies count, as in GNU (`region_kill_internal`
+    /// bumps the flag for `copy-region-as-kill` too, kill.c:445-449), and
+    /// an attempted kill that moves no text still counts (kill.c:150-153).
+    ///
+    /// Pastes, [`Yank`](EditCommand::Yank) and
+    /// [`YankPop`](EditCommand::YankPop) read the ring without feeding it,
+    /// so they break a merge chain just like GNU's non-kill commands do.
+    pub(crate) fn feeds_kill_ring(&self) -> bool {
+        match self {
+            EditCommand::Cut { .. }
+            | EditCommand::Change { .. }
+            | EditCommand::CutChar
+            | EditCommand::CutCharLeft
+            | EditCommand::BackspaceWord
+            | EditCommand::CutCurrentLine
+            | EditCommand::CutFromStart
+            | EditCommand::CutFromStartLinewise { .. }
+            | EditCommand::CutFromLineStart
+            | EditCommand::CutFromLineNonBlankStart
+            | EditCommand::CutToEnd
+            | EditCommand::CutToEndLinewise { .. }
+            | EditCommand::CutToLineEnd
+            | EditCommand::KillLine
+            | EditCommand::CutWordLeft
+            | EditCommand::CutBigWordLeft
+            | EditCommand::CutWordRight
+            | EditCommand::CutBigWordRight
+            | EditCommand::CutWordRightToNext
+            | EditCommand::CutBigWordRightToNext
+            | EditCommand::CutRightUntil(_)
+            | EditCommand::CutRightBefore(_)
+            | EditCommand::CutLeftUntil(_)
+            | EditCommand::CutLeftBefore(_)
+            | EditCommand::CutSelection { .. }
+            | EditCommand::CutTextObject { .. }
+            | EditCommand::CutFilenameLeft
+            | EditCommand::Copy { .. }
+            | EditCommand::CopySelection
+            | EditCommand::CopyFromStart
+            | EditCommand::CopyFromStartLinewise
+            | EditCommand::CopyFromLineStart
+            | EditCommand::CopyFromLineNonBlankStart
+            | EditCommand::CopyToEnd
+            | EditCommand::CopyToEndLinewise
+            | EditCommand::CopyToLineEnd
+            | EditCommand::CopyCurrentLine
+            | EditCommand::CopyWordLeft
+            | EditCommand::CopyBigWordLeft
+            | EditCommand::CopyWordRight
+            | EditCommand::CopyBigWordRight
+            | EditCommand::CopyWordRightToNext
+            | EditCommand::CopyBigWordRightToNext
+            | EditCommand::CopyLeft
+            | EditCommand::CopyRight
+            | EditCommand::CopyRightUntil(_)
+            | EditCommand::CopyRightBefore(_)
+            | EditCommand::CopyLeftUntil(_)
+            | EditCommand::CopyLeftBefore(_)
+            | EditCommand::CopyTextObject { .. } => true,
+            // The system-clipboard cut still feeds the local ring through
+            // `cut_range`; the system copy does not.
+            #[cfg(feature = "system_clipboard")]
+            EditCommand::CutSelectionSystem => true,
+            _ => false,
         }
     }
 }

@@ -11,10 +11,12 @@ use crate::enums::{
     UndoBehavior,
 };
 use crate::prompt::PromptEditMode;
-use crate::{core_editor::get_local_clipboard, EditCommand};
+use crate::{core_editor::LocalClipboard, EditCommand};
 use crate::{Direction, Granularity, MotionTarget, WordEdge, WordKind};
 use std::cmp::{max, min};
-use std::ops::{DerefMut, Range};
+#[cfg(feature = "system_clipboard")]
+use std::ops::DerefMut;
+use std::ops::Range;
 
 /// Stateful editor executing changes to the underlying [`LineBuffer`]
 ///
@@ -22,7 +24,10 @@ use std::ops::{DerefMut, Range};
 /// the undo/redo history and has facilities for cut/copy/yank/paste
 pub struct Editor {
     line_buffer: LineBuffer,
-    cut_buffer: Box<dyn Clipboard>,
+    /// GNU `rl_kill_ring` (kill.c:63): a capped ring of kill slots, not a
+    /// single register — see [`LocalClipboard`]. Every cut/copy path feeds
+    /// it through [`kill_range_to_ring`](Self::kill_range_to_ring).
+    cut_buffer: LocalClipboard,
     #[cfg(feature = "system_clipboard")]
     system_clipboard: Box<dyn Clipboard>,
     edit_stack: EditStack<LineBuffer>,
@@ -40,6 +45,18 @@ pub struct Editor {
     /// carets (emacs, vi insert) always cross regardless, since a bar may rest in
     /// the gap around a `\n`. Defaults to `true`.
     cross_line_cursor: bool,
+    /// `_rl_last_command_was_kill` (readline.c:588,715-716): re-armed by each
+    /// kill-class [`EditCommand`] run through [`run_edit_command`], cleared by
+    /// any other command and by handled non-edit events
+    /// ([`note_non_edit_dispatch`](Self::note_non_edit_dispatch)). Consecutive
+    /// kills merge into the ring's newest slot while it holds.
+    ///
+    /// [`run_edit_command`]: Self::run_edit_command
+    last_command_was_kill: bool,
+    /// `rl_last_func` for the `rl_yank_pop` gate (kill.c:531): the most recent
+    /// [`EditCommand`] executed. `YankPop` applies only when this is `Yank`
+    /// or `YankPop`.
+    last_edit_command: Option<EditCommand>,
 }
 
 /// Whether an [`EditCommand`] could be applied in the current editor state.
@@ -75,7 +92,7 @@ impl Default for Editor {
     fn default() -> Self {
         Editor {
             line_buffer: LineBuffer::new(),
-            cut_buffer: get_local_clipboard(),
+            cut_buffer: LocalClipboard::new(),
             #[cfg(feature = "system_clipboard")]
             system_clipboard: get_system_clipboard(),
             edit_stack: EditStack::new(),
@@ -83,6 +100,8 @@ impl Default for Editor {
             edit_mode: PromptEditMode::Default,
             policy_unsettled: false,
             cross_line_cursor: true,
+            last_command_was_kill: false,
+            last_edit_command: None,
         }
     }
 }
@@ -283,7 +302,7 @@ impl Editor {
             EditCommand::Delete => self.delete(),
             EditCommand::CutChar => self.cut_char(),
             EditCommand::CutCharLeft => self.cut_char_left(),
-            EditCommand::BackspaceWord => self.line_buffer.delete_word_left(),
+            EditCommand::BackspaceWord => self.backspace_word(),
             EditCommand::DeleteWord => self.line_buffer.delete_word_right(),
             EditCommand::DeleteHorizontalSpace => self.line_buffer.delete_horizontal_space(),
             EditCommand::Clear => self.line_buffer.clear(),
@@ -309,6 +328,9 @@ impl Editor {
             EditCommand::CutBigWordRightToNext => self.cut_big_word_right_to_next(),
             EditCommand::PasteCutBufferBefore => self.paste_cut_buffer_before(),
             EditCommand::PasteCutBufferAfter => self.paste_cut_buffer_after(),
+            EditCommand::Yank => self.yank(),
+            EditCommand::YankPop => status = self.yank_pop(),
+            EditCommand::CutFilenameLeft => self.cut_filename_left(),
             EditCommand::PasteAtSelectionEdge { direction, count } => {
                 self.paste_at_selection_edge(*direction, *count)
             }
@@ -370,31 +392,20 @@ impl Editor {
             EditCommand::CopyLeftBefore(c) => self.copy_left_until_char(*c, true, true),
             EditCommand::CopyCurrentLine => {
                 let range = self.line_buffer.current_line_range();
-                let copy_slice = &self.line_buffer.get_buffer()[range];
-                if !copy_slice.is_empty() {
-                    self.cut_buffer.set(copy_slice, Granularity::LineWise);
-                }
+                self.kill_range_to_ring(range, Granularity::LineWise);
             }
             EditCommand::CopyLeft => {
                 let insertion_offset = self.line_buffer.insertion_point();
                 if insertion_offset > 0 {
                     let left_index = self.line_buffer.grapheme_left_index();
-                    let copy_range = left_index..insertion_offset;
-                    self.cut_buffer.set(
-                        &self.line_buffer.get_buffer()[copy_range],
-                        Granularity::CharWise,
-                    );
+                    self.kill_range_to_ring(left_index..insertion_offset, Granularity::CharWise);
                 }
             }
             EditCommand::CopyRight => {
                 let insertion_offset = self.line_buffer.insertion_point();
                 let right_index = self.line_buffer.grapheme_right_index();
                 if right_index > insertion_offset {
-                    let copy_range = insertion_offset..right_index;
-                    self.cut_buffer.set(
-                        &self.line_buffer.get_buffer()[copy_range],
-                        Granularity::CharWise,
-                    );
+                    self.kill_range_to_ring(insertion_offset..right_index, Granularity::CharWise);
                 }
             }
             EditCommand::SwapCursorAndAnchor => self
@@ -437,6 +448,13 @@ impl Editor {
 
         self.commit_cursor();
 
+        // readline.c:715-716 (`lk == _rl_last_command_was_kill` → clear) —
+        // only a kill-class command re-arms the merge flag; everything else
+        // breaks the chain, including a motion that moved nothing. `rl_last_func`
+        // (kill.c:531) is the record `YankPop`'s gate reads.
+        self.last_command_was_kill = command.feeds_kill_ring();
+        self.last_edit_command = Some(command.clone());
+
         if matches!(command.edit_type(), EditType::MoveCursor { .. })
             && self.line_buffer.cursor() == initial_cursor
         {
@@ -460,6 +478,25 @@ impl Editor {
 
         self.update_undo_state(new_undo_behavior);
         status
+    }
+
+    /// readline.c:715-716: a handled non-edit event is still a dispatched
+    /// command — it clears `_rl_last_command_was_kill` and overwrites
+    /// `rl_last_func` even though it never reaches the editor. The engine
+    /// calls this for handled events that ran no [`EditCommand`].
+    pub(crate) fn note_non_edit_dispatch(&mut self) {
+        self.last_command_was_kill = false;
+        self.last_edit_command = None;
+    }
+
+    /// The ring's current slot (`rl_kill_ring[rl_kill_index]`) and its live
+    /// slot count — what `yank`/`yank-pop` would read, for tests.
+    #[cfg(test)]
+    pub(crate) fn current_kill(&self) -> (String, usize) {
+        (
+            self.cut_buffer.yank_entry().unwrap_or_default().0,
+            self.cut_buffer.ring_len(),
+        )
     }
 
     pub(crate) fn clear_selection(&mut self) {
@@ -536,6 +573,40 @@ impl Editor {
                 self.line_buffer.set_insertion_point(delete.start);
             }
         }
+    }
+
+    /// Whether the active mode is vi — GNU's `rl_editing_mode == vi_mode`
+    /// test (kill.c:131), under which consecutive kills never merge into the
+    /// ring's newest slot (it is replaced instead).
+    fn vi_editing(&self) -> bool {
+        matches!(self.edit_mode, PromptEditMode::Vi(_))
+    }
+
+    /// `_rl_copy_to_kill_ring` (kill.c:90-155): feed `text` into the ring.
+    /// `append` is GNU's `from < to` direction — `true` when the killed text
+    /// sat forward of the point, `false` when it sat before it.
+    fn push_kill(&mut self, text: &str, granularity: Granularity, append: bool) {
+        self.cut_buffer.push_kill(
+            text,
+            granularity,
+            append,
+            self.last_command_was_kill,
+            self.vi_editing(),
+        );
+    }
+
+    /// Feed the buffer's `range` into the kill ring, deriving the merge
+    /// direction the way `rl_kill_text(from, to)` does (kill.c:146-148): a
+    /// span beginning at the caret is a forward kill (appended to the newest
+    /// slot); a span ending at — or covering — the caret is backward
+    /// (prepended). The funnel every cut/copy path routes through.
+    fn kill_range_to_ring(&mut self, range: Range<usize>, granularity: Granularity) {
+        if range.is_empty() {
+            return;
+        }
+        let append = range.start >= self.line_buffer.insertion_point();
+        let text = self.line_buffer.get_buffer()[range].to_string();
+        self.push_kill(&text, granularity, append);
     }
 
     /// Plant or clear a selection anchor explicitly — retained only for test
@@ -969,9 +1040,8 @@ impl Editor {
     fn cut_current_line(&mut self) {
         let deletion_range = self.line_buffer.current_line_range();
 
-        let cut_slice = &self.line_buffer.get_buffer()[deletion_range.clone()];
-        if !cut_slice.is_empty() {
-            self.cut_buffer.set(cut_slice, Granularity::LineWise);
+        if !deletion_range.is_empty() {
+            self.kill_range_to_ring(deletion_range.clone(), Granularity::LineWise);
             self.line_buffer.set_insertion_point(deletion_range.start);
             self.line_buffer.clear_range(deletion_range);
         }
@@ -980,10 +1050,7 @@ impl Editor {
     fn cut_from_start(&mut self) {
         let insertion_offset = self.line_buffer.insertion_point();
         if insertion_offset > 0 {
-            self.cut_buffer.set(
-                &self.line_buffer.get_buffer()[..insertion_offset],
-                Granularity::CharWise,
-            );
+            self.kill_range_to_ring(0..insertion_offset, Granularity::CharWise);
             self.line_buffer.clear_to_insertion_point();
         }
     }
@@ -1002,10 +1069,7 @@ impl Editor {
                 }
             });
         if end_offset > 0 {
-            self.cut_buffer.set(
-                &self.line_buffer.get_buffer()[..end_offset],
-                Granularity::LineWise,
-            );
+            self.kill_range_to_ring(0..end_offset, Granularity::LineWise);
             self.line_buffer.clear_range(..end_offset);
             self.line_buffer.move_to_start();
         }
@@ -1015,9 +1079,12 @@ impl Editor {
         let previous_offset = self.line_buffer.insertion_point();
         self.line_buffer.move_to_line_start();
         let deletion_range = self.line_buffer.insertion_point()..previous_offset;
-        let cut_slice = &self.line_buffer.get_buffer()[deletion_range.clone()];
-        if !cut_slice.is_empty() {
-            self.cut_buffer.set(cut_slice, Granularity::CharWise);
+        // The caret already moved to the line start, so the span's direction
+        // is fixed here rather than inferred — GNU: `rl_kill_text` with
+        // `from > to` is a backward (prepended) kill.
+        if !deletion_range.is_empty() {
+            let text = self.line_buffer.get_buffer()[deletion_range.clone()].to_string();
+            self.push_kill(&text, Granularity::CharWise, false);
             self.line_buffer.clear_range(deletion_range);
         }
     }
@@ -1031,9 +1098,10 @@ impl Editor {
     }
 
     fn cut_from_end(&mut self) {
-        let cut_slice = &self.line_buffer.get_buffer()[self.line_buffer.insertion_point()..];
-        if !cut_slice.is_empty() {
-            self.cut_buffer.set(cut_slice, Granularity::CharWise);
+        let insertion_offset = self.line_buffer.insertion_point();
+        let len = self.line_buffer.len();
+        self.kill_range_to_ring(insertion_offset..len, Granularity::CharWise);
+        if insertion_offset < len {
             self.line_buffer.clear_to_end();
         }
     }
@@ -1059,20 +1127,16 @@ impl Editor {
         });
 
         if delete_start < len {
-            let register_slice = &self.line_buffer.get_buffer()[register_start..];
-            if !register_slice.is_empty() {
-                self.cut_buffer.set(register_slice, Granularity::LineWise);
-            }
+            self.kill_range_to_ring(register_start..len, Granularity::LineWise);
             self.line_buffer.set_insertion_point(delete_start);
             self.line_buffer.clear_to_end();
         }
     }
 
     fn cut_to_line_end(&mut self) {
-        let cut_slice = &self.line_buffer.get_buffer()
-            [self.line_buffer.insertion_point()..self.line_buffer.find_current_line_end()];
-        if !cut_slice.is_empty() {
-            self.cut_buffer.set(cut_slice, Granularity::CharWise);
+        let range = self.line_buffer.insertion_point()..self.line_buffer.find_current_line_end();
+        if !range.is_empty() {
+            self.kill_range_to_ring(range, Granularity::CharWise);
             self.line_buffer.clear_to_line_end();
         }
     }
@@ -1211,11 +1275,10 @@ impl Editor {
             // Saving the section of the string that will be deleted to be
             // stored into the buffer
             let extra = if before_char { 0 } else { c.len_utf8() };
-            let cut_slice =
-                &self.line_buffer.get_buffer()[self.line_buffer.insertion_point()..index + extra];
+            let cut_range = self.line_buffer.insertion_point()..index + extra;
 
-            if !cut_slice.is_empty() {
-                self.cut_buffer.set(cut_slice, Granularity::CharWise);
+            if !cut_range.is_empty() {
+                self.kill_range_to_ring(cut_range, Granularity::CharWise);
 
                 if before_char {
                     self.line_buffer.delete_right_before_char(c, current_line);
@@ -1231,11 +1294,10 @@ impl Editor {
             // Saving the section of the string that will be deleted to be
             // stored into the buffer
             let extra = if before_char { c.len_utf8() } else { 0 };
-            let cut_slice =
-                &self.line_buffer.get_buffer()[index + extra..self.line_buffer.insertion_point()];
+            let cut_range = index + extra..self.line_buffer.insertion_point();
 
-            if !cut_slice.is_empty() {
-                self.cut_buffer.set(cut_slice, Granularity::CharWise);
+            if !cut_range.is_empty() {
+                self.kill_range_to_ring(cut_range, Granularity::CharWise);
 
                 if before_char {
                     self.line_buffer.delete_left_before_char(c, current_line);
@@ -1377,8 +1439,7 @@ impl Editor {
             return EditCommandStatus::Inapplicable;
         };
 
-        let cut_slice = &self.line_buffer.get_buffer()[start..end];
-        self.cut_buffer.set(cut_slice, Granularity::CharWise);
+        self.kill_range_to_ring(start..end, Granularity::CharWise);
         EditCommandStatus::Applied
     }
 
@@ -1628,11 +1689,81 @@ impl Editor {
     }
 
     fn paste_cut_buffer_before(&mut self) {
-        insert_clipboard_content_before(&mut self.line_buffer, self.cut_buffer.deref_mut());
+        insert_clipboard_content_before(&mut self.line_buffer, &mut self.cut_buffer);
     }
 
     fn paste_cut_buffer_after(&mut self) {
-        insert_clipboard_content_after(&mut self.line_buffer, self.cut_buffer.deref_mut());
+        insert_clipboard_content_after(&mut self.line_buffer, &mut self.cut_buffer);
+    }
+
+    /// `rl_yank` (kill.c:509-525): insert the ring's current slot at the
+    /// caret. GNU also drops the mark at the pre-insert point
+    /// (`_rl_set_mark_at_pos`) — reedline has no invisible mark, and opening
+    /// a selection there would let the next insert delete the yanked text,
+    /// so only the insertion is kept. `YankPop` verifies the text instead.
+    fn yank(&mut self) {
+        if let Some((content, _)) = self.cut_buffer.yank_entry() {
+            self.insert_str(&content);
+        }
+    }
+
+    /// `rl_yank_pop` (kill.c:527-556): only directly after `Yank`/`YankPop`
+    /// (`rl_last_func`), and only while the just-yanked text still literally
+    /// precedes the caret (`STREQN`). Verified, the text is deleted, the
+    /// ring index walks down with wraparound, and the older entry is
+    /// re-yanked; otherwise a ding — `Inapplicable` here.
+    fn yank_pop(&mut self) -> EditCommandStatus {
+        if !matches!(
+            self.last_edit_command,
+            Some(EditCommand::Yank | EditCommand::YankPop)
+        ) {
+            return EditCommandStatus::Inapplicable;
+        }
+        let Some((text, _)) = self.cut_buffer.yank_entry() else {
+            return EditCommandStatus::Inapplicable;
+        };
+        let point = self.line_buffer.insertion_point();
+        let Some(start) = point.checked_sub(text.len()) else {
+            return EditCommandStatus::Inapplicable;
+        };
+        // STREQN (kill.c:542): the just-yanked text must still literally
+        // precede point. `get` over `[]` — a mismatch can leave `start`
+        // mid-grapheme, where slicing would panic; GNU's byte compare
+        // simply fails the same way.
+        if self.line_buffer.get_buffer().get(start..point) != Some(text.as_str()) {
+            return EditCommandStatus::Inapplicable;
+        }
+        self.cut_buffer.rotate_kill_index();
+        self.line_buffer.clear_range_safe(start..point);
+        self.line_buffer.set_insertion_point(start);
+        if let Some((next, _)) = self.cut_buffer.yank_entry() {
+            self.line_buffer.insert_str(&next);
+        }
+        EditCommandStatus::Applied
+    }
+
+    /// `rl_unix_filename_rubout` (kill.c:338-397): kill one pathname
+    /// component backward — whitespace, a `/` run, then a non-`/`/
+    /// non-whitespace component — into the ring (backward, so prepended on
+    /// merge). A zero-width kill moves nothing but still counts as a kill,
+    /// matching GNU's early `_rl_last_command_was_kill++` (kill.c:150-153).
+    fn cut_filename_left(&mut self) {
+        let point = self.line_buffer.insertion_point();
+        let start = self.line_buffer.filename_component_left_index();
+        if start < point {
+            self.cut_range(start..point);
+        }
+    }
+
+    /// GNU `unix-word-rubout` (`C-w`) / `backward-kill-word` (`M-rubout`):
+    /// the rubbed-out word is killed into the ring like `rl_kill_text`
+    /// rather than deleted outright. A backward kill — prepended on merge.
+    fn backspace_word(&mut self) {
+        let point = self.line_buffer.insertion_point();
+        let left = self.line_buffer.word_left_index();
+        if left < point {
+            self.cut_range(left..point);
+        }
     }
 
     fn cut_range(&mut self, range: Range<usize>) {
@@ -1652,10 +1783,7 @@ impl Editor {
     }
 
     fn copy_range_with(&mut self, range: Range<usize>, granularity: Granularity) {
-        if range.start < range.end {
-            let slice = &self.line_buffer.get_buffer()[range];
-            self.cut_buffer.set(slice, granularity);
-        }
+        self.kill_range_to_ring(range, granularity);
     }
 
     /// Return the range of the word under the cursor.
@@ -1940,10 +2068,7 @@ impl Editor {
     pub(crate) fn copy_from_start(&mut self) {
         let insertion_offset = self.line_buffer.insertion_point();
         if insertion_offset > 0 {
-            self.cut_buffer.set(
-                &self.line_buffer.get_buffer()[..insertion_offset],
-                Granularity::CharWise,
-            );
+            self.kill_range_to_ring(0..insertion_offset, Granularity::CharWise);
         }
     }
 
@@ -1953,10 +2078,7 @@ impl Editor {
             .find('\n')
             .map_or(self.line_buffer.len(), |offset| insertion_point + offset);
         if end_offset > 0 {
-            self.cut_buffer.set(
-                &self.line_buffer.get_buffer()[..end_offset],
-                Granularity::LineWise,
-            );
+            self.kill_range_to_ring(0..end_offset, Granularity::LineWise);
         }
         self.line_buffer.move_to_start();
     }
@@ -1989,11 +2111,14 @@ impl Editor {
     }
 
     pub(crate) fn copy_from_end_linewise(&mut self) {
+        // The caret was moved to the line start, so fix the direction rather
+        // than inferring it — the copied span ran forward of the original
+        // point (GNU: `from < to` appends).
         self.line_buffer.move_to_line_start();
         let copy_range = self.line_buffer.insertion_point()..self.line_buffer.len();
         if copy_range.start < copy_range.end {
-            let slice = &self.line_buffer.get_buffer()[copy_range];
-            self.cut_buffer.set(slice, Granularity::LineWise);
+            let text = self.line_buffer.get_buffer()[copy_range].to_string();
+            self.push_kill(&text, Granularity::LineWise, true);
         }
     }
 
