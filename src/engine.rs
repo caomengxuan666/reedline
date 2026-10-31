@@ -44,6 +44,7 @@ use {
         terminal, QueueableCommand,
     },
     std::{
+        collections::VecDeque,
         fs::File,
         io,
         io::Result,
@@ -251,6 +252,12 @@ pub struct Reedline {
 
     // Whether lines should be accepted immediately
     immediately_accept: bool,
+
+    // Keystrokes queued by [`ReedlineEvent::KeySequence`], consumed at the
+    // head of the next input batch before live terminal input — the
+    // readline macro buffer (GNU readline.c rl_executing_macro / push_back
+    // onto the input stream). Bounded by [`Self::MAX_REPLAYED_KEYS`].
+    pending_input: VecDeque<Event>,
 
     // External break signal: when set to `true`, `read_line()` will return
     // `Signal::ExternalBreak` with the current buffer contents.
@@ -546,6 +553,7 @@ impl Reedline {
             bracketed_paste: BracketedPasteGuard::default(),
             kitty_protocol: KittyProtocolGuard::default(),
             immediately_accept: false,
+            pending_input: VecDeque::new(),
             break_signal: None,
             repaint_signal: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
@@ -1355,7 +1363,11 @@ impl Reedline {
             let mut events: Vec<Event> = vec![];
 
             if !self.immediately_accept {
-                if self.input_needs_polling() || completer_pending {
+                if !self.pending_input.is_empty() {
+                    // Replayed keys are already input: skip the terminal
+                    // read entirely so a KeySequence never blocks behind a
+                    // keystroke that has not arrived.
+                } else if self.input_needs_polling() || completer_pending {
                     if event::poll(self.poll_interval)? {
                         events.push(crossterm::event::read()?);
                     }
@@ -1568,11 +1580,36 @@ impl Reedline {
         accept_lone_value
     }
 
+    /// Upper bound on the replayed-key queue
+    /// ([`ReedlineEvent::KeySequence`]): a self-retriggering sequence keeps
+    /// enqueuing until the cap drops the overflow, so a runaway macro
+    /// terminates instead of spinning the input loop forever.
+    pub const MAX_REPLAYED_KEYS: usize = 4096;
+
+    /// Queue a replayed key sequence (the [`ReedlineEvent::KeySequence`]
+    /// payload) as synthetic `Press` input ahead of live terminal input.
+    /// Keys beyond [`Self::MAX_REPLAYED_KEYS`] pending are dropped.
+    fn enqueue_replayed_keys(&mut self, keys: Vec<crate::KeyCombination>) {
+        let room = Self::MAX_REPLAYED_KEYS.saturating_sub(self.pending_input.len());
+        self.pending_input.extend(
+            keys.into_iter()
+                .take(room)
+                .map(|key| Event::Key(KeyEvent::new(key.key_code, key.modifier))),
+        );
+    }
+
     fn process_input_batch(
         &mut self,
         prompt: &dyn Prompt,
-        events: Vec<Event>,
+        mut events: Vec<Event>,
     ) -> Result<ControlFlow<Signal>> {
+        // Replayed keys dispatch before live input, like readline's macro
+        // buffer sitting at the head of the input stream.
+        if !self.pending_input.is_empty() {
+            let mut replayed = std::mem::take(&mut self.pending_input);
+            replayed.extend(events);
+            events = replayed.into_iter().collect();
+        }
         // Convert `Event` into `ReedlineEvent`. Also, fuse consecutive
         // `ReedlineEvent::EditCommand` into one. Also, if there're multiple
         // `ReedlineEvent::Resize`, only keep the last one.
@@ -1745,6 +1782,13 @@ impl Reedline {
     }
 
     fn handle_event(&mut self, prompt: &dyn Prompt, event: ReedlineEvent) -> Result<EventStatus> {
+        // A replayed key sequence is input, not an action: it queues at the
+        // head of the next input batch and resolves through whatever keymap
+        // is live then — the same in every input mode.
+        if let ReedlineEvent::KeySequence(keys) = event {
+            self.enqueue_replayed_keys(keys);
+            return Ok(EventStatus::Handled);
+        }
         if self.input_mode == InputMode::HistorySearch {
             self.handle_history_search_event(event)
         } else {
@@ -1861,6 +1905,7 @@ impl Reedline {
             | ReedlineEvent::Left
             | ReedlineEvent::ToStart
             | ReedlineEvent::ToEnd
+            | ReedlineEvent::KeySequence(_)
             | ReedlineEvent::Multiple(_)
             | ReedlineEvent::None
             | ReedlineEvent::HistoryHintWordComplete
@@ -2019,6 +2064,13 @@ impl Reedline {
                     }
                     None => Ok(EventStatus::Inapplicable),
                 }
+            }
+            ReedlineEvent::KeySequence(keys) => {
+                // Nested inside `Multiple`: queues for the next input
+                // batch — the Multiple's remaining events still run
+                // first (documented on the variant).
+                self.enqueue_replayed_keys(keys);
+                Ok(EventStatus::Handled)
             }
             ReedlineEvent::HistoryHintComplete => Ok(self.accept_history_hint(true)),
             ReedlineEvent::HistoryHintWordComplete => Ok(self.accept_history_hint(false)),
@@ -4584,6 +4636,139 @@ mod tests {
         assert_eq!(rl.editor.get_buffer(), "hi");
         assert_eq!(rl.current_insertion_point(), 2);
         assert_eq!(rl.current_selection(), None);
+    }
+
+    fn kc(modifier: KeyModifiers, key_code: KeyCode) -> crate::KeyCombination {
+        crate::KeyCombination { modifier, key_code }
+    }
+
+    /// A readline-style macro bound to `Ctrl-X`: replayed keys dispatch
+    /// through the keymap the next batch, not literally.
+    #[test]
+    fn key_sequence_replays_through_the_keymap() {
+        let mut rl = seam_engine(emacs_with(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('x'),
+            ReedlineEvent::KeySequence(vec![
+                kc(KeyModifiers::NONE, KeyCode::Char('h')),
+                kc(KeyModifiers::NONE, KeyCode::Char('i')),
+            ]),
+        ));
+        // The trigger produces no buffer change itself — the sequence is
+        // input queued for the next batch.
+        drive(
+            &mut rl,
+            &[KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)],
+        );
+        assert_eq!(rl.editor.get_buffer(), "");
+        assert_eq!(rl.pending_input.len(), 2);
+        drive(&mut rl, &[]);
+        assert_eq!(rl.editor.get_buffer(), "hi");
+        assert_eq!(rl.current_insertion_point(), 2);
+    }
+
+    /// A replayed key resolves against the map live at replay time:
+    /// binding a function key inside a sequence runs the bound event,
+    /// not a literal insert.
+    #[test]
+    fn key_sequence_dispatch_uses_bound_events() {
+        let mut rl = seam_engine(emacs_with(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('x'),
+            // "ab" then MoveToLineStart then 'z' => buffer "zab".
+            ReedlineEvent::KeySequence(vec![
+                kc(KeyModifiers::NONE, KeyCode::Char('a')),
+                kc(KeyModifiers::NONE, KeyCode::Char('b')),
+                kc(KeyModifiers::CONTROL, KeyCode::Char('a')),
+                kc(KeyModifiers::NONE, KeyCode::Char('z')),
+            ]),
+        ));
+        drive(
+            &mut rl,
+            &[KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)],
+        );
+        drive(&mut rl, &[]);
+        assert_eq!(rl.editor.get_buffer(), "zab");
+        assert_eq!(rl.current_insertion_point(), 1);
+    }
+
+    /// A macro may replay a key bound to another KeySequence: the nested
+    /// sequence queues behind the remainder of the outer one.
+    #[test]
+    fn key_sequence_nests() {
+        let mut emacs = crate::default_emacs_keybindings();
+        emacs.add_binding(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('y'),
+            ReedlineEvent::KeySequence(vec![kc(KeyModifiers::NONE, KeyCode::Char('Y'))]),
+        );
+        emacs.add_binding(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('x'),
+            ReedlineEvent::KeySequence(vec![
+                kc(KeyModifiers::CONTROL, KeyCode::Char('y')),
+                kc(KeyModifiers::NONE, KeyCode::Char('X')),
+            ]),
+        );
+        let mut rl = seam_engine(Box::new(crate::Emacs::new(emacs)));
+        drive(
+            &mut rl,
+            &[KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)],
+        );
+        drive(&mut rl, &[]); // C-y replays -> queues 'Y'; 'X' inserts
+        assert_eq!(rl.editor.get_buffer(), "X");
+        drive(&mut rl, &[]); // 'Y' replays
+        assert_eq!(rl.editor.get_buffer(), "XY");
+    }
+
+    /// A sequence ending in Enter submits the line, like a typed Enter.
+    #[test]
+    fn key_sequence_enter_submits() {
+        let mut rl = seam_engine(emacs_with(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('x'),
+            ReedlineEvent::KeySequence(vec![
+                kc(KeyModifiers::NONE, KeyCode::Char('o')),
+                kc(KeyModifiers::NONE, KeyCode::Char('k')),
+                kc(KeyModifiers::NONE, KeyCode::Enter),
+            ]),
+        ));
+        let prompt = DefaultPrompt::default();
+        rl.process_input_batch(
+            &prompt,
+            vec![Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL,
+            ))],
+        )
+        .expect("trigger batch ok");
+        match rl
+            .process_input_batch(&prompt, vec![])
+            .expect("replay batch ok")
+        {
+            ControlFlow::Break(Signal::Success(line)) => assert_eq!(line, "ok"),
+            other => panic!("expected line submit, got {other:?}"),
+        }
+    }
+
+    /// The queue is bounded: a payload over the cap is truncated, and a
+    /// retriggering sequence cannot grow the queue past the cap.
+    #[test]
+    fn key_sequence_queue_is_capped() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        rl.enqueue_replayed_keys(vec![
+            kc(KeyModifiers::NONE, KeyCode::Char('a'));
+            Reedline::MAX_REPLAYED_KEYS + 10
+        ]);
+        assert_eq!(rl.pending_input.len(), Reedline::MAX_REPLAYED_KEYS);
+        rl.pending_input.clear();
+        // Re-enqueueing on a near-full queue only takes the room left.
+        rl.enqueue_replayed_keys(vec![
+            kc(KeyModifiers::NONE, KeyCode::Char('b'));
+            Reedline::MAX_REPLAYED_KEYS - 1
+        ]);
+        rl.enqueue_replayed_keys(vec![kc(KeyModifiers::NONE, KeyCode::Char('c')); 10]);
+        assert_eq!(rl.pending_input.len(), Reedline::MAX_REPLAYED_KEYS);
     }
 
     #[test]

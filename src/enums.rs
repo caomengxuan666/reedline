@@ -1257,6 +1257,26 @@ pub enum ReedlineEvent {
     /// active is declined the same way, so a binding built as
     /// `UntilFound([SwitchMode(A), SwitchMode(B)])` toggles between the two.
     SwitchMode(PromptEditMode),
+
+    /// Replays a sequence of keys as if the user had typed them.
+    ///
+    /// This is the mechanism GNU readline's `bind '"key": "macro"'` needs:
+    /// a macro's payload is not text to insert but a byte stream of
+    /// keystrokes, each dispatched through the keymap when it is
+    /// *consumed* — not when the sequence was registered. A replayed key
+    /// may therefore fire any binding, including another `KeySequence`;
+    /// literal characters belong in the stream as
+    /// `(KeyModifiers::NONE, KeyCode::Char(c))` and reach the buffer
+    /// through the ordinary self-insert path, which also makes the same
+    /// sequence do the right thing under vi-mode maps where letters are
+    /// bound to motions.
+    ///
+    /// Replayed keys are queued ahead of live terminal input and consumed
+    /// at the start of the next input batch — so inside a [`Multiple`], a
+    /// `KeySequence` enqueues while the remaining events still run first.
+    /// The queue is bounded ([`crate::Reedline::MAX_REPLAYED_KEYS`]); a
+    /// self-retriggering sequence is truncated once the cap is reached.
+    KeySequence(Vec<crate::edit_mode::KeyCombination>),
 }
 
 pub enum EventStatus {
