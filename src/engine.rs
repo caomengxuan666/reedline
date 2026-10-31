@@ -2543,6 +2543,7 @@ impl Reedline {
             | ReedlineEvent::DigitArgument(_)
             | ReedlineEvent::UniversalArgument
             | ReedlineEvent::WithArg { .. }
+            | ReedlineEvent::OverwriteMode(_)
             | ReedlineEvent::Multiple(_)
             | ReedlineEvent::None
             | ReedlineEvent::HistoryHintWordComplete
@@ -2747,6 +2748,13 @@ impl Reedline {
                 direction,
                 anchored,
             } => self.history_search_line(direction, anchored),
+            ReedlineEvent::OverwriteMode(on) => {
+                // GNU rl_overwrite_mode: arg>0 sets, arg<=0 clears,
+                // no arg toggles.
+                let next = on.unwrap_or(!self.editor.overwrite());
+                self.editor.set_overwrite(next);
+                Ok(EventStatus::Handled)
+            }
             ReedlineEvent::HistoryHintComplete => Ok(self.accept_history_hint(true)),
             ReedlineEvent::HistoryHintWordComplete => Ok(self.accept_history_hint(false)),
             ReedlineEvent::Esc => {
@@ -6016,6 +6024,33 @@ mod tests {
         let mut rl = seam_engine(Box::<crate::Emacs>::default());
         drive(&mut rl, &[alt('0'), ch('a')]);
         assert_eq!(rl.editor.get_buffer(), "");
+    }
+
+    /// Insert key toggles overwrite-mode; typed chars then replace.
+    #[test]
+    fn overwrite_mode_replaces_graphemes() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        drive(&mut rl, &[ch('a'), ch('b'), ch('c'), ch('d')]);
+        drive(
+            &mut rl,
+            &[
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE),
+                ch('x'),
+                ch('y'),
+            ],
+        );
+        assert_eq!(rl.editor.get_buffer(), "abxy");
+        // Toggling off inserts again.
+        drive(
+            &mut rl,
+            &[
+                KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE),
+                ch('z'),
+            ],
+        );
+        assert_eq!(rl.editor.get_buffer(), "abxyz");
     }
 
     #[test]

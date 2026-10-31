@@ -1568,6 +1568,11 @@ pub enum ReedlineEvent {
         /// The terminating key's own event.
         event: Box<ReedlineEvent>,
     },
+
+    /// GNU `overwrite-mode` (misc.c rl_overwrite_mode, bound to the
+    /// Insert key): `None` toggles, `Some(on)` sets explicitly — the
+    /// explicit-arg form in GNU (`arg>0` overwrites, `arg<=0` inserts).
+    OverwriteMode(Option<bool>),
 }
 
 pub enum EventStatus {

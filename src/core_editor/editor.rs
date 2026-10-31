@@ -57,6 +57,11 @@ pub struct Editor {
     /// [`EditCommand`] executed. `YankPop` applies only when this is `Yank`
     /// or `YankPop`.
     last_edit_command: Option<EditCommand>,
+    /// GNU `overwrite-mode` (misc.c rl_overwrite_mode): when set, an inserted
+    /// char replaces the grapheme under the cursor instead of pushing it right
+    /// (text.c _rl_overwrite_char — insert then delete one). Only plain
+    /// `InsertChar` honors it, like GNU.
+    overwrite: bool,
 }
 
 /// Whether an [`EditCommand`] could be applied in the current editor state.
@@ -102,6 +107,7 @@ impl Default for Editor {
             cross_line_cursor: true,
             last_command_was_kill: false,
             last_edit_command: None,
+            overwrite: false,
         }
     }
 }
@@ -1664,6 +1670,25 @@ impl Editor {
     fn insert_char(&mut self, c: char) {
         self.line_buffer.delete_selection();
         self.line_buffer.insert_char(c);
+        // _rl_overwrite_char (text.c:949): at a non-end point the new char
+        // replaces the grapheme it landed before.
+        if self.overwrite {
+            let point = self.line_buffer.insertion_point();
+            if point < self.line_buffer.len() {
+                self.line_buffer
+                    .clear_range(point..self.line_buffer.grapheme_right_index());
+            }
+        }
+    }
+
+    /// `overwrite-mode` state (readline misc.c rl_insert_mode inversion).
+    pub fn set_overwrite(&mut self, on: bool) {
+        self.overwrite = on;
+    }
+
+    /// Whether overwrite-mode is engaged.
+    pub fn overwrite(&self) -> bool {
+        self.overwrite
     }
 
     fn insert_str(&mut self, str: &str) {
