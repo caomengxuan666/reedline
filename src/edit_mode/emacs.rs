@@ -157,18 +157,36 @@ pub fn default_emacs_keybindings() -> Keybindings {
     kb.add_binding(KM::ALT, KC::Char('l'), edit_bind(EC::LowercaseWord));
     kb.add_binding(KM::ALT, KC::Char('c'), edit_bind(EC::CapitalizeChar));
 
+    // GNU `digit-argument` (misc.c:230): `M-0`..`M-9` accumulate the
+    // numeric argument, `M--` negates it — the emacs_meta_keymap rows
+    // (emacs_keymap.c:366-380). `C-u` stays `unix-line-discard`, which
+    // is GNU's binding for it too (emacs_keymap.c:56).
+    for d in 0..=9u8 {
+        kb.add_binding(
+            KM::ALT,
+            KC::Char(char::from(b'0' + d)),
+            ReedlineEvent::DigitArgument(Some(d)),
+        );
+    }
+    kb.add_binding(KM::ALT, KC::Char('-'), ReedlineEvent::DigitArgument(None));
+
     kb
 }
 
 /// This parses the incoming Events like a emacs style-editor
 pub struct Emacs {
     keybindings: Keybindings,
+    /// `C-x` pressed and the chord unresolved: GNU keeps a whole
+    /// `emacs_ctlx_keymap` for it (emacs_keymap.c:59 `ISKMAP`), which a
+    /// flat `Keybindings` cannot express — one pending slot stands in.
+    pending_prefix: bool,
 }
 
 impl Default for Emacs {
     fn default() -> Self {
         Emacs {
             keybindings: default_emacs_keybindings(),
+            pending_prefix: false,
         }
     }
 }
@@ -178,49 +196,71 @@ impl EditMode for Emacs {
         match event.into() {
             Event::Key(KeyEvent {
                 code, modifiers, ..
-            }) => match (modifiers, code) {
-                (modifier, KeyCode::Char(c)) => {
-                    // Note. The modifier can also be a combination of modifiers, for
-                    // example:
-                    //     KeyModifiers::CONTROL | KeyModifiers::ALT
-                    //     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
-                    //
-                    // Mixed modifiers are used by non american keyboards that have extra
-                    // keys like 'alt gr'. Keep this in mind if in the future there are
-                    // cases where an event is not being captured
-                    let c = match modifier {
-                        KeyModifiers::NONE => c,
-                        _ => c.to_ascii_lowercase(),
-                    };
-
-                    self.keybindings
-                        .find_binding(modifier, KeyCode::Char(c))
-                        .unwrap_or_else(|| {
-                            if modifier == KeyModifiers::NONE
-                                || modifier == KeyModifiers::SHIFT
-                                || modifier == KeyModifiers::CONTROL | KeyModifiers::ALT
-                                || modifier
-                                    == KeyModifiers::CONTROL
-                                        | KeyModifiers::ALT
-                                        | KeyModifiers::SHIFT
-                            {
-                                ReedlineEvent::Edit(vec![EditCommand::InsertChar(
-                                    if modifier == KeyModifiers::SHIFT {
-                                        c.to_ascii_uppercase()
-                                    } else {
-                                        c
-                                    },
-                                )])
-                            } else {
-                                ReedlineEvent::None
-                            }
-                        })
+            }) => {
+                // A pending `C-x` resolves against GNU's ctlx keymap
+                // first: the second key decides the event regardless of
+                // its own binding (emacs_keymap.c:597+), an unbound one
+                // dings.
+                if self.pending_prefix {
+                    self.pending_prefix = false;
+                    return Self::resolve_ctrl_x(modifiers, code);
                 }
-                _ => self
-                    .keybindings
-                    .find_binding(modifiers, code)
-                    .unwrap_or(ReedlineEvent::None),
-            },
+                match (modifiers, code) {
+                    (modifier, KeyCode::Char(c)) => {
+                        // Note. The modifier can also be a combination of modifiers, for
+                        // example:
+                        //     KeyModifiers::CONTROL | KeyModifiers::ALT
+                        //     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+                        //
+                        // Mixed modifiers are used by non american keyboards that have extra
+                        // keys like 'alt gr'. Keep this in mind if in the future there are
+                        // cases where an event is not being captured
+                        let c = match modifier {
+                            KeyModifiers::NONE => c,
+                            _ => c.to_ascii_lowercase(),
+                        };
+
+                        self.keybindings
+                            .find_binding(modifier, KeyCode::Char(c))
+                            .or_else(|| {
+                                // `C-x` is a prefix keymap in GNU's
+                                // emacs map (emacs_keymap.c:59 ISKMAP),
+                                // flattened into `pending_prefix` and
+                                // resolved on the next key. An explicit
+                                // binding still wins, matching a GNU
+                                // rebind of the prefix.
+                                (modifier == KeyModifiers::CONTROL && c == 'x').then(|| {
+                                    self.pending_prefix = true;
+                                    ReedlineEvent::Pending
+                                })
+                            })
+                            .unwrap_or_else(|| {
+                                if modifier == KeyModifiers::NONE
+                                    || modifier == KeyModifiers::SHIFT
+                                    || modifier == KeyModifiers::CONTROL | KeyModifiers::ALT
+                                    || modifier
+                                        == KeyModifiers::CONTROL
+                                            | KeyModifiers::ALT
+                                            | KeyModifiers::SHIFT
+                                {
+                                    ReedlineEvent::Edit(vec![EditCommand::InsertChar(
+                                        if modifier == KeyModifiers::SHIFT {
+                                            c.to_ascii_uppercase()
+                                        } else {
+                                            c
+                                        },
+                                    )])
+                                } else {
+                                    ReedlineEvent::None
+                                }
+                            })
+                    }
+                    _ => self
+                        .keybindings
+                        .find_binding(modifiers, code)
+                        .unwrap_or(ReedlineEvent::None),
+                }
+            }
 
             event => parse_non_key_event(event),
         }
@@ -233,7 +273,11 @@ impl EditMode for Emacs {
     fn handle_mode_specific_event(&mut self, event: ReedlineEvent) -> EventStatus {
         // One state, so the only switch emacs accepts is into itself.
         match event {
-            ReedlineEvent::SwitchMode(PromptEditMode::Emacs) => EventStatus::Handled,
+            ReedlineEvent::SwitchMode(PromptEditMode::Emacs) => {
+                // Entering fresh drops a half-typed chord.
+                self.pending_prefix = false;
+                EventStatus::Handled
+            }
             _ => EventStatus::Inapplicable,
         }
     }
@@ -242,7 +286,29 @@ impl EditMode for Emacs {
 impl Emacs {
     /// Emacs style input parsing constructor if you want to use custom keybindings
     pub const fn new(keybindings: Keybindings) -> Self {
-        Emacs { keybindings }
+        Emacs {
+            keybindings,
+            pending_prefix: false,
+        }
+    }
+
+    /// The `C-x` prefix table — GNU `emacs_ctlx_keymap`
+    /// (emacs_keymap.c:597+): `(`/`)`/`e` are the keyboard-macro
+    /// commands, `C-u` is `rl_undo_command`, `C-g` aborts. Anything
+    /// else is unbound — GNU dings. Shift counts as the bare
+    /// character: the kitty protocol reports `(` as Shift-9.
+    fn resolve_ctrl_x(modifiers: KeyModifiers, code: KeyCode) -> ReedlineEvent {
+        match (modifiers, code) {
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('(')) => {
+                ReedlineEvent::StartKbdMacro
+            }
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(')')) => {
+                ReedlineEvent::EndKbdMacro
+            }
+            (KeyModifiers::NONE, KeyCode::Char('e')) => ReedlineEvent::CallLastKbdMacro,
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => edit_bind(EditCommand::Undo),
+            _ => ReedlineEvent::None,
+        }
     }
 }
 
@@ -361,6 +427,85 @@ mod test {
         assert_eq!(
             result,
             ReedlineEvent::Edit(vec![EditCommand::InsertChar('😀')])
+        );
+    }
+
+    fn key(c: char, modifiers: KeyModifiers) -> ReedlineRawEvent {
+        ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(KeyCode::Char(c), modifiers))).unwrap()
+    }
+
+    /// `C-x` arms the chord prefix (`ReedlineEvent::Pending`); the next
+    /// key resolves against GNU's ctlx keymap — `(`/`)`/`e` are the
+    /// macro commands, `C-u` is undo, anything else dings.
+    #[test]
+    fn ctrl_x_prefix_resolves_macro_chords() {
+        let mut emacs = Emacs::default();
+        let cx = || key('x', KeyModifiers::CONTROL);
+
+        assert_eq!(emacs.parse_event(cx()), ReedlineEvent::Pending);
+        assert_eq!(
+            emacs.parse_event(key('(', KeyModifiers::NONE)),
+            ReedlineEvent::StartKbdMacro
+        );
+        assert_eq!(emacs.parse_event(cx()), ReedlineEvent::Pending);
+        assert_eq!(
+            emacs.parse_event(key(')', KeyModifiers::NONE)),
+            ReedlineEvent::EndKbdMacro
+        );
+        assert_eq!(emacs.parse_event(cx()), ReedlineEvent::Pending);
+        assert_eq!(
+            emacs.parse_event(key('e', KeyModifiers::NONE)),
+            ReedlineEvent::CallLastKbdMacro
+        );
+        assert_eq!(emacs.parse_event(cx()), ReedlineEvent::Pending);
+        assert_eq!(
+            emacs.parse_event(key('u', KeyModifiers::CONTROL)),
+            ReedlineEvent::Edit(vec![EditCommand::Undo])
+        );
+        // An unbound chord key dings (None) and clears the prefix —
+        // the same key self-inserts on the next press.
+        assert_eq!(emacs.parse_event(cx()), ReedlineEvent::Pending);
+        assert_eq!(
+            emacs.parse_event(key('q', KeyModifiers::NONE)),
+            ReedlineEvent::None
+        );
+        assert_eq!(
+            emacs.parse_event(key('q', KeyModifiers::NONE)),
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('q')])
+        );
+    }
+
+    /// An explicit binding on `C-x` wins over the prefix, matching a
+    /// GNU rebind of the keymap slot.
+    #[test]
+    fn explicit_ctrl_x_binding_wins_over_prefix() {
+        let mut keybindings = default_emacs_keybindings();
+        keybindings.add_binding(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('x'),
+            ReedlineEvent::ClearScreen,
+        );
+        let mut emacs = Emacs::new(keybindings);
+        assert_eq!(
+            emacs.parse_event(key('x', KeyModifiers::CONTROL)),
+            ReedlineEvent::ClearScreen
+        );
+    }
+
+    /// `M-0`..`M-9` parse to `DigitArgument`, `M--` to the sign —
+    /// emacs_meta_keymap's digit-argument rows (emacs_keymap.c:366-380).
+    #[test]
+    fn alt_digits_parse_to_digit_argument() {
+        let mut emacs = Emacs::default();
+        for (c, d) in ('0'..='9').zip(0..=9) {
+            assert_eq!(
+                emacs.parse_event(key(c, KeyModifiers::ALT)),
+                ReedlineEvent::DigitArgument(Some(d))
+            );
+        }
+        assert_eq!(
+            emacs.parse_event(key('-', KeyModifiers::ALT)),
+            ReedlineEvent::DigitArgument(None)
         );
     }
 

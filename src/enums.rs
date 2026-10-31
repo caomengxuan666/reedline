@@ -1493,6 +1493,81 @@ pub enum ReedlineEvent {
         /// `false` for a substring match (GNU `history-substr-search-*`)
         anchored: bool,
     },
+
+    /// The keypress was absorbed as the first half of a chord the edit
+    /// mode is still collecting — the `C-x` of GNU's `C-x )`, which is
+    /// a prefix *keymap* in the emacs map (`emacs_keymap.c:59`,
+    /// `ISKMAP emacs_ctlx_keymap`), flattened here into a one-key
+    /// pending state since `Keybindings` has no prefix tables.
+    ///
+    /// `Pending` produces no action; the next key resolves the chord.
+    /// The engine's macro recorder erases an absorbed prefix key from
+    /// the recording — GNU records it, then strips the resolved
+    /// sequence's whole key count when a chord reaches a macro command
+    /// (`macro.c:276`, `rl_key_sequence_length`), which nets out the
+    /// same for `C-x )` and additionally keeps aborted chords out of
+    /// the recording.
+    Pending,
+
+    /// Begin keyboard-macro recording (GNU `rl_start_kbd_macro`,
+    /// `macro.c:246` — `C-x (` in the emacs `C-x` map). Every later key
+    /// press is recorded verbatim until
+    /// [`EndKbdMacro`](ReedlineEvent::EndKbdMacro): keystrokes, not
+    /// commands (`readline.c:907`, `_rl_add_macro_char` runs ahead of
+    /// dispatch), so the recording replays through whatever keymap is
+    /// live then. Aborts — GNU dings — when already recording.
+    StartKbdMacro,
+
+    /// End keyboard-macro recording and keep it as the replayable last
+    /// macro (GNU `rl_end_kbd_macro`, `macro.c:270` — `C-x )`). The
+    /// keys that invoked it are not part of the recording (GNU
+    /// subtracts `rl_key_sequence_length`). An explicit numeric
+    /// argument makes GNU execute the new macro `count - 1` more
+    /// times, counting the definition as the first run (`macro.c:283`).
+    EndKbdMacro,
+
+    /// Replay the last recorded keyboard macro (GNU
+    /// `rl_call_last_kbd_macro`, `macro.c:291` — `C-x e`), a numeric
+    /// argument repeating it that many times. Refused while a
+    /// recording is in progress — GNU's "no recursive macros" —
+    /// replayed keys queue ahead of live input exactly like
+    /// [`KeySequence`](ReedlineEvent::KeySequence).
+    CallLastKbdMacro,
+
+    /// Accumulate a digit into the pending numeric argument (GNU
+    /// `rl_digit_argument`, `misc.c:230`): `Some(d)` is an `M-0`..`M-9`
+    /// key, `None` is `M--`, which negates the argument. Fully applied
+    /// at parse time — the argument is engine state and a real key
+    /// never reaches a handler; GNU reads the rest of the argument
+    /// inside `rl_digit_loop` (`misc.c:192`) instead.
+    DigitArgument(Option<u8>),
+
+    /// Multiply the pending numeric argument by four (GNU
+    /// `rl_universal_argument`, `misc.c:262`). Unbound in the default
+    /// emacs map — GNU binds `C-u` to `unix-line-discard` there
+    /// (`emacs_keymap.c:56`), which stays ours. Applied at parse time
+    /// like [`DigitArgument`](ReedlineEvent::DigitArgument).
+    UniversalArgument,
+
+    /// The key that terminated numeric-argument accumulation,
+    /// dispatched under the argument (GNU `misc.c`
+    /// `_rl_arg_dispatch:174`: every non-argument key ends the loop and
+    /// is itself dispatched with `count = rl_numeric_arg *
+    /// rl_arg_sign`).
+    ///
+    /// `explicit` mirrors `rl_explicit_arg` — set once a digit was
+    /// seen, or `M--` was upgraded to `-1` by GNU's `NUM_SAWMINUS`
+    /// rule (`misc.c:170`). Nothing consumes it yet; it is carried so
+    /// count-aware commands (GNU's yank-last-arg, overwrite-mode) can
+    /// later tell "no argument" from "the argument was 1".
+    WithArg {
+        /// `rl_numeric_arg * rl_arg_sign` (`readline.c:941`)
+        count: i32,
+        /// `rl_explicit_arg`
+        explicit: bool,
+        /// The terminating key's own event.
+        event: Box<ReedlineEvent>,
+    },
 }
 
 pub enum EventStatus {

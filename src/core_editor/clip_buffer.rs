@@ -71,7 +71,7 @@ impl LocalClipboard {
     ) {
         if merge && !self.ring.is_empty() {
             let slot = self.ring.len() - 1;
-            let (old, _) = std::mem::take(&mut self.ring[slot]);
+            let (old, _) = self.ring[slot].clone();
             let merged = if vi || append {
                 // vi: replace; emacs forward: old ++ new
                 if vi {
