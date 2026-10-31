@@ -1493,6 +1493,47 @@ pub enum ReedlineEvent {
         /// `false` for a substring match (GNU `history-substr-search-*`)
         anchored: bool,
     },
+||||||| parent of 5cda717 (feat(macro): keyboard-macro recording — C-x ( C-x ) C-x e)
+
+    /// The keypress was absorbed as the first half of a chord the edit
+    /// mode is still collecting — the `C-x` of GNU's `C-x )`, which is
+    /// a prefix *keymap* in the emacs map (`emacs_keymap.c:59`,
+    /// `ISKMAP emacs_ctlx_keymap`), flattened here into a one-key
+    /// pending state since `Keybindings` has no prefix tables.
+    ///
+    /// `Pending` produces no action; the next key resolves the chord.
+    /// The engine's macro recorder erases an absorbed prefix key from
+    /// the recording — GNU records it, then strips the resolved
+    /// sequence's whole key count when a chord reaches a macro command
+    /// (`macro.c:276`, `rl_key_sequence_length`), which nets out the
+    /// same for `C-x )` and additionally keeps aborted chords out of
+    /// the recording.
+    Pending,
+
+    /// Begin keyboard-macro recording (GNU `rl_start_kbd_macro`,
+    /// `macro.c:246` — `C-x (` in the emacs `C-x` map). Every later key
+    /// press is recorded verbatim until
+    /// [`EndKbdMacro`](ReedlineEvent::EndKbdMacro): keystrokes, not
+    /// commands (`readline.c:907`, `_rl_add_macro_char` runs ahead of
+    /// dispatch), so the recording replays through whatever keymap is
+    /// live then. Aborts — GNU dings — when already recording.
+    StartKbdMacro,
+
+    /// End keyboard-macro recording and keep it as the replayable last
+    /// macro (GNU `rl_end_kbd_macro`, `macro.c:270` — `C-x )`). The
+    /// keys that invoked it are not part of the recording (GNU
+    /// subtracts `rl_key_sequence_length`). An explicit numeric
+    /// argument makes GNU execute the new macro `count - 1` more
+    /// times, counting the definition as the first run (`macro.c:283`).
+    EndKbdMacro,
+
+    /// Replay the last recorded keyboard macro (GNU
+    /// `rl_call_last_kbd_macro`, `macro.c:291` — `C-x e`), a numeric
+    /// argument repeating it that many times. Refused while a
+    /// recording is in progress — GNU's "no recursive macros" —
+    /// replayed keys queue ahead of live input exactly like
+    /// [`KeySequence`](ReedlineEvent::KeySequence).
+    CallLastKbdMacro,
 }
 
 pub enum EventStatus {

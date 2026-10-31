@@ -345,6 +345,19 @@ pub struct Reedline {
     // search.c:701,737,755).
     history_line_search: Option<HistoryLineSearch>,
 
+    // Keyboard-macro recording (GNU `RL_STATE_MACRODEF` +
+    // `current_macro`, macro.c): `Some` once
+    // `ReedlineEvent::StartKbdMacro` has armed it — every key press is
+    // appended BEFORE it is parsed (readline.c:907 `_rl_add_macro_char`
+    // runs ahead of dispatch), so the recording holds keystrokes, not
+    // commands, and replays through whatever keymap is live then.
+    recording: Option<Vec<crate::KeyCombination>>,
+
+    // The recording `ReedlineEvent::EndKbdMacro` last finished (GNU
+    // `current_macro` after `rl_end_kbd_macro`, macro.c:270);
+    // `CallLastKbdMacro` replays it through `enqueue_replayed_keys`.
+    last_macro: Vec<crate::KeyCombination>,
+
     // Nesting depth of the event currently being handled — set from the
     // pending_input tag for replayed keys, 0 for live input. A
     // KeySequence handled at depth d enqueues at d+1.
@@ -678,6 +691,8 @@ impl Reedline {
             immediately_accept: false,
             pending_input: VecDeque::new(),
             event_replay_depths: VecDeque::new(),
+            recording: None,
+            last_macro: Vec::new(),
             quoted_insert: false,
             edit_dispatched: false,
             pending_char_search: None,
@@ -1750,6 +1765,50 @@ impl Reedline {
         );
     }
 
+    /// `rl_start_kbd_macro` (macro.c:246): arm the recorder. An
+    /// explicit argument is GNU's append mode (macro.c:253-258): the
+    /// previous macro is replayed first and keeps recording, so the
+    /// new definition heads with it — here the replayed keys append to
+    /// the seed as they dispatch, exactly like GNU's resumed
+    /// `current_macro`. Aborts — GNU dings — when already recording,
+    /// leaving the recorder armed.
+    fn start_kbd_macro(&mut self, explicit: bool) {
+        if self.recording.is_some() {
+            return;
+        }
+        let seed = if explicit && !self.last_macro.is_empty() {
+            self.enqueue_replayed_keys(self.last_macro.clone(), self.replay_depth + 1);
+            self.last_macro.clone()
+        } else {
+            Vec::new()
+        };
+        self.recording = Some(seed);
+    }
+
+    /// `rl_end_kbd_macro` (macro.c:270): stash the recording as
+    /// `last_macro`. Returns false — GNU aborts — when not recording.
+    fn end_kbd_macro(&mut self) -> bool {
+        match self.recording.take() {
+            Some(keys) => {
+                self.last_macro = keys;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `rl_call_last_kbd_macro` (macro.c:291): push the recording into
+    /// input `count` times. Refused — GNU dings "no recursive macros"
+    /// — while recording, or with nothing recorded yet.
+    fn call_last_kbd_macro(&mut self, count: i64) {
+        if self.recording.is_some() || self.last_macro.is_empty() {
+            return;
+        }
+        for _ in 0..count {
+            self.enqueue_replayed_keys(self.last_macro.clone(), self.replay_depth + 1);
+        }
+    }
+
     fn process_input_batch(
         &mut self,
         prompt: &dyn Prompt,
@@ -1790,6 +1849,27 @@ impl Reedline {
         // the burst batch too and must not be swallowed there.
         let mut resize = None;
         if burst_batch {
+            // Macro recording sees the paste's keystrokes before the
+            // burst coalesces them away — GNU records pasted bytes into
+            // the macro the same way (kill.c:721).
+            if let Some(recording) = self.recording.as_mut() {
+                for event in &events {
+                    if let Event::Key(KeyEvent {
+                        code,
+                        modifiers,
+                        kind,
+                        ..
+                    }) = event
+                    {
+                        if *kind != KeyEventKind::Release {
+                            recording.push(crate::KeyCombination {
+                                modifier: *modifiers,
+                                key_code: *code,
+                            });
+                        }
+                    }
+                }
+            }
             let mut coalesced = String::new();
             // Every Enter drained into this batch is coalesced as an embedded
             // newline, never a submit. An Enter only reaches this loop by
@@ -1842,6 +1922,28 @@ impl Reedline {
             let mut edits = vec![];
             for event in events {
                 self.replay_depth = self.event_replay_depths.pop_front().unwrap_or(0);
+                // Macro recording runs ahead of everything, the way
+                // GNU's `_rl_add_macro_char` appends every dispatched
+                // key before dispatching it (readline.c:907): the
+                // recording holds keystrokes — including replayed ones,
+                // which dispatch again — so it replays through whatever
+                // keymap is live then.
+                if let Some(recording) = self.recording.as_mut() {
+                    if let Event::Key(KeyEvent {
+                        code,
+                        modifiers,
+                        kind,
+                        ..
+                    }) = event
+                    {
+                        if kind != KeyEventKind::Release {
+                            recording.push(crate::KeyCombination {
+                                modifier: modifiers,
+                                key_code: code,
+                            });
+                        }
+                    }
+                }
                 // Reclassify a newline key (bare `Enter`, or `Ctrl-J` for a raw
                 // LF) that the oracle judges paste-embedded into a newline even
                 // when a full burst was NOT detected (a short fast paste, e.g.
@@ -1889,10 +1991,103 @@ impl Reedline {
                     }
                     continue;
                 }
-                if let Ok(event) = ReedlineRawEvent::try_from(event) {
-                    match self.edit_mode.parse_event(event) {
+                if let Ok(raw) = ReedlineRawEvent::try_from(event) {
+                    match self.edit_mode.parse_event(raw) {
+                        // A chord's prefix half produced no event — the
+                        // `C-x` of `C-x )`. It is not part of a macro
+                        // recording either: GNU strips the resolved
+                        // sequence's keys at `rl_end_kbd_macro`
+                        // (macro.c:276); erasing the prefix as it arrives
+                        // nets out the same and keeps aborted chords out.
+                        ReedlineEvent::Pending => {
+                            if let Some(recording) = self.recording.as_mut() {
+                                recording.pop();
+                            }
+                        }
+                        // Macro controls are engine state, applied at
+                        // parse time like QuotedInsert below.
+                        ReedlineEvent::StartKbdMacro => {
+                            self.start_kbd_macro(false);
+                        }
+                        ReedlineEvent::EndKbdMacro => {
+                            // The keys that invoked end are not part of
+                            // the recording — GNU subtracts
+                            // `rl_key_sequence_length` (macro.c:276);
+                            // the `C-x` half was already erased by
+                            // `Pending` above.
+                            if let Some(recording) = self.recording.as_mut() {
+                                recording.pop();
+                            }
+                            self.end_kbd_macro();
+                        }
+                        ReedlineEvent::CallLastKbdMacro => {
+                            if self.recording.is_some() {
+                                // "no recursive macros" (macro.c:296):
+                                // refused, and the invoking key is
+                                // erased from the recording.
+                                if let Some(recording) = self.recording.as_mut() {
+                                    recording.pop();
+                                }
+                            } else {
+                                self.call_last_kbd_macro(1);
+                            }
+                        }
+                        // A chord's prefix half produced no event — the
+                        // `C-x` of `C-x )`. It is not part of a macro
+                        // recording either: GNU strips the resolved
+                        // sequence's keys at `rl_end_kbd_macro`
+                        // (macro.c:276); erasing the prefix as it arrives
+                        // nets out the same and keeps aborted chords out.
+                        ReedlineEvent::Pending => {
+                            if let Some(recording) = self.recording.as_mut() {
+                                recording.pop();
+                            }
+                        }
+                        // Macro controls are engine state, applied at
+                        // parse time like QuotedInsert below.
+                        ReedlineEvent::StartKbdMacro => {
+                            self.start_kbd_macro(false);
+                        }
+                        ReedlineEvent::EndKbdMacro => {
+                            // The keys that invoked end are not part of
+                            // the recording — GNU subtracts
+                            // `rl_key_sequence_length` (macro.c:276);
+                            // the `C-x` half was already erased by
+                            // `Pending` above.
+                            if let Some(recording) = self.recording.as_mut() {
+                                recording.pop();
+                            }
+                            self.end_kbd_macro();
+                        }
+                        ReedlineEvent::CallLastKbdMacro => {
+                            if self.recording.is_some() {
+                                // "no recursive macros" (macro.c:296):
+                                // refused, and the invoking key is
+                                // erased from the recording.
+                                if let Some(recording) = self.recording.as_mut() {
+                                    recording.pop();
+                                }
+                            } else {
+                                self.call_last_kbd_macro(1);
+                            }
+                        }
                         ReedlineEvent::Edit(edit) => edits.extend(edit),
                         ReedlineEvent::Resize(x, y) => resize = Some((x, y)),
+                        // Quoted-insert is fully applied at parse
+                        // time: fast typists deliver the trigger and
+                        // the next key in one batch, and the next
+                        // event is consumed right below. Pushing the
+                        // event would let its handler re-arm a flag
+                        // the batch already spent.
+                        ReedlineEvent::QuotedInsert => {
+                            if !edits.is_empty() {
+                                reedline_events.push((
+                                    ReedlineEvent::Edit(std::mem::take(&mut edits)),
+                                    self.replay_depth,
+                                ));
+                            }
+                            self.quoted_insert = true;
+                        }
                         event => {
                             if !edits.is_empty() {
                                 reedline_events.push((
@@ -1900,15 +2095,7 @@ impl Reedline {
                                     self.replay_depth,
                                 ));
                             }
-                            // Quoted-insert is fully applied at parse
-                            // time: fast typists deliver the trigger and
-                            // the next key in one batch, and the next
-                            // event is consumed right below. Pushing the
-                            // event would let its handler re-arm a flag
-                            // the batch already spent.
-                            if matches!(event, ReedlineEvent::QuotedInsert) {
-                                self.quoted_insert = true;
-                            } else if let ReedlineEvent::CharSearch { direction } = event {
+                            if let ReedlineEvent::CharSearch { direction } = event {
                                 self.pending_char_search = Some(direction);
                             } else if let ReedlineEvent::KeySequence(keys) = event {
                                 // Applied at parse time where the source's
@@ -2003,6 +2190,31 @@ impl Reedline {
             return Ok(EventStatus::Handled);
         }
         self.edit_dispatched = false;
+        // Macro controls are engine state — a real key press reaches
+        // here only through a `Multiple` or a programmatic push, so
+        // they apply without the parse-time keystroke bookkeeping
+        // (the recording pops).
+        match event {
+            ReedlineEvent::StartKbdMacro => {
+                self.start_kbd_macro(false);
+                return Ok(EventStatus::Handled);
+            }
+            ReedlineEvent::EndKbdMacro => {
+                return Ok(if self.end_kbd_macro() {
+                    EventStatus::Handled
+                } else {
+                    EventStatus::Inapplicable
+                });
+            }
+            ReedlineEvent::CallLastKbdMacro => {
+                if self.recording.is_some() || self.last_macro.is_empty() {
+                    return Ok(EventStatus::Inapplicable);
+                }
+                self.call_last_kbd_macro(1);
+                return Ok(EventStatus::Handled);
+            }
+            _ => {}
+        }
         let status = if self.input_mode == InputMode::HistorySearch {
             self.handle_history_search_event(event)
         } else {
@@ -2142,6 +2354,10 @@ impl Reedline {
             | ReedlineEvent::YankNthArg { .. }
             | ReedlineEvent::OperateAndGetNext
             | ReedlineEvent::HistorySearch { .. }
+            | ReedlineEvent::Pending
+            | ReedlineEvent::StartKbdMacro
+            | ReedlineEvent::EndKbdMacro
+            | ReedlineEvent::CallLastKbdMacro
             | ReedlineEvent::Multiple(_)
             | ReedlineEvent::None
             | ReedlineEvent::HistoryHintWordComplete
@@ -2642,7 +2858,14 @@ impl Reedline {
                 }
                 Ok(EventStatus::Handled)
             }
-            ReedlineEvent::None => Ok(EventStatus::Inapplicable),
+            // Everything below is applied at parse time or intercepted in
+            // `handle_event` before the mode dispatch — reaching this arm
+            // means a programmatic call, where inapplicable is honest.
+            ReedlineEvent::None
+            | ReedlineEvent::Pending
+            | ReedlineEvent::StartKbdMacro
+            | ReedlineEvent::EndKbdMacro
+            | ReedlineEvent::CallLastKbdMacro => Ok(EventStatus::Inapplicable),
         }
     }
 
@@ -5351,6 +5574,145 @@ mod tests {
             ],
         );
         assert_eq!(rl.editor.get_buffer(), "abc");
+    }
+
+    /// `C-x (`/`C-x )`/`C-x e` — GNU's start/end/call-kbd-macro
+    /// (macro.c:246/270/291). The recording holds the keystrokes
+    /// between the parens, replayed through the live keymap.
+    #[test]
+    fn kbd_macro_records_and_replays() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        let cx = ctrl('x');
+        drive(&mut rl, &[cx, ch('('), ch('h'), ch('i'), cx, ch(')')]);
+        // Typed keys both record and act.
+        assert_eq!(rl.editor.get_buffer(), "hi");
+        // The invoking keystrokes are not part of the recording:
+        // start's `(` arrives before the recorder arms, and GNU strips
+        // `rl_key_sequence_length` at end (macro.c:276) — which also
+        // erases the `C-x` prefix half.
+        assert_eq!(
+            rl.last_macro,
+            vec![
+                kc(KeyModifiers::NONE, KeyCode::Char('h')),
+                kc(KeyModifiers::NONE, KeyCode::Char('i')),
+            ]
+        );
+        // `C-x e` queues the replay ahead of live input.
+        drive(&mut rl, &[cx, ch('e')]);
+        assert_eq!(rl.pending_input.len(), 2);
+        drive(&mut rl, &[]);
+        assert_eq!(rl.editor.get_buffer(), "hihi");
+    }
+
+    /// Recording captures keystrokes, not commands: a bound key like
+    /// `C-a` is stored raw and re-dispatches through the keymap on
+    /// replay.
+    #[test]
+    fn kbd_macro_records_bound_commands() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        let cx = ctrl('x');
+        drive(
+            &mut rl,
+            &[
+                ch('a'),
+                ch('b'),
+                cx,
+                ch('('),
+                ctrl('a'),
+                ch('z'),
+                cx,
+                ch(')'),
+            ],
+        );
+        // 'z' landed after C-a moved to line start.
+        assert_eq!(rl.editor.get_buffer(), "zab");
+        assert_eq!(
+            rl.last_macro,
+            vec![
+                kc(KeyModifiers::CONTROL, KeyCode::Char('a')),
+                kc(KeyModifiers::NONE, KeyCode::Char('z')),
+            ]
+        );
+        drive(&mut rl, &[cx, ch('e')]);
+        drive(&mut rl, &[]);
+        assert_eq!(rl.editor.get_buffer(), "zzab");
+    }
+
+    /// The quoted-insert's consumed key is recorded too (text.c:1051),
+    /// so the replay re-arms and re-consumes literally.
+    #[test]
+    fn kbd_macro_records_quoted_insert_keys() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        let cx = ctrl('x');
+        drive(&mut rl, &[cx, ch('('), ctrl('v'), ctrl('b'), cx, ch(')')]);
+        assert_eq!(rl.editor.get_buffer(), "\u{2}");
+        assert_eq!(
+            rl.last_macro,
+            vec![
+                kc(KeyModifiers::CONTROL, KeyCode::Char('v')),
+                kc(KeyModifiers::CONTROL, KeyCode::Char('b')),
+            ]
+        );
+        drive(&mut rl, &[cx, ch('e')]);
+        drive(&mut rl, &[]);
+        assert_eq!(rl.editor.get_buffer(), "\u{2}\u{2}");
+    }
+
+    /// `C-x (` while recording aborts — GNU dings (macro.c:248) — and
+    /// the recorder stays armed; the dead `(` stays recorded the way
+    /// GNU's does.
+    #[test]
+    fn kbd_macro_start_during_recording_dings_and_keeps_recording() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        let cx = ctrl('x');
+        drive(
+            &mut rl,
+            &[cx, ch('('), ch('a'), cx, ch('('), ch('b'), cx, ch(')')],
+        );
+        // The aborted `(` dispatches start-kbd-macro, not self-insert —
+        // it inserts nothing, but its keystroke stays recorded.
+        assert_eq!(rl.editor.get_buffer(), "ab");
+        assert_eq!(
+            rl.last_macro,
+            vec![
+                kc(KeyModifiers::NONE, KeyCode::Char('a')),
+                kc(KeyModifiers::NONE, KeyCode::Char('(')),
+                kc(KeyModifiers::NONE, KeyCode::Char('b')),
+            ]
+        );
+    }
+
+    /// `C-x e` while recording is refused — "no recursive macros"
+    /// (macro.c:296) — and the refused `e` is erased from the
+    /// recording along with its `C-x`.
+    #[test]
+    fn kbd_macro_call_during_recording_is_refused() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        let cx = ctrl('x');
+        drive(
+            &mut rl,
+            &[cx, ch('('), ch('a'), cx, ch('e'), ch('b'), cx, ch(')')],
+        );
+        assert_eq!(rl.editor.get_buffer(), "ab");
+        assert_eq!(
+            rl.last_macro,
+            vec![
+                kc(KeyModifiers::NONE, KeyCode::Char('a')),
+                kc(KeyModifiers::NONE, KeyCode::Char('b')),
+            ]
+        );
+        // And nothing replayed mid-recording.
+        assert!(rl.pending_input.is_empty());
+    }
+
+    /// `C-x e` with nothing recorded dings — GNU aborts on
+    /// `current_macro == 0` (macro.c:293).
+    #[test]
+    fn kbd_macro_call_without_recording_does_nothing() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        drive(&mut rl, &[ctrl('x'), ch('e'), ch('a')]);
+        assert!(rl.pending_input.is_empty());
+        assert_eq!(rl.editor.get_buffer(), "a");
     }
 
     #[test]
