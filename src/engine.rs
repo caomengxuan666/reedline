@@ -257,12 +257,28 @@ pub struct Reedline {
     // head of the next input batch before live terminal input — the
     // readline macro buffer (GNU readline.c rl_executing_macro / push_back
     // onto the input stream). Bounded by [`Self::MAX_REPLAYED_KEYS`].
-    pending_input: VecDeque<Event>,
+    // Each entry carries its macro nesting depth (GNU MAX_MACRO_LEVEL
+    // semantics): keys a live keypress enqueues start at depth 1; a
+    // KeySequence inside replayed input nests one deeper, and a macro
+    // that would pass MAX_MACRO_NESTING is dropped — GNU aborts the
+    // same way instead of spinning on self-recursive sequences.
+    pending_input: VecDeque<(Event, u16)>,
+
+    // Depth of each event in the batch currently being parsed, in
+    // order — populated when pending_input is merged ahead of live
+    // input (live events are depth 0). Consumed as the batch is
+    // collected and again as reedline_events are handled.
+    event_replay_depths: VecDeque<u16>,
 
     // `ReedlineEvent::QuotedInsert` armed: the next key press is consumed
     // as literal data instead of dispatching through the keymap (GNU
     // readline.c rl_quoted_insert — one input character verbatim).
     quoted_insert: bool,
+
+    // Nesting depth of the event currently being handled — set from the
+    // pending_input tag for replayed keys, 0 for live input. A
+    // KeySequence handled at depth d enqueues at d+1.
+    replay_depth: u16,
 
     // External break signal: when set to `true`, `read_line()` will return
     // `Signal::ExternalBreak` with the current buffer contents.
@@ -591,7 +607,9 @@ impl Reedline {
             kitty_protocol: KittyProtocolGuard::default(),
             immediately_accept: false,
             pending_input: VecDeque::new(),
+            event_replay_depths: VecDeque::new(),
             quoted_insert: false,
+            replay_depth: 0,
             break_signal: None,
             repaint_signal: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
@@ -1626,13 +1644,22 @@ impl Reedline {
 
     /// Queue a replayed key sequence (the [`ReedlineEvent::KeySequence`]
     /// payload) as synthetic `Press` input ahead of live terminal input.
-    /// Keys beyond [`Self::MAX_REPLAYED_KEYS`] pending are dropped.
-    fn enqueue_replayed_keys(&mut self, keys: Vec<crate::KeyCombination>) {
+    /// [`Self::MAX_MACRO_NESTING`]: GNU `macro.c MAX_MACRO_LEVEL` —
+    /// a sequence nesting deeper than this is dropped rather than run.
+    pub const MAX_MACRO_NESTING: u16 = 16;
+
+    /// Keys beyond [`Self::MAX_REPLAYED_KEYS`] pending are dropped; a
+    /// sequence emitted deeper than [`Self::MAX_MACRO_NESTING`] aborts
+    /// whole, like GNU's nesting guard.
+    fn enqueue_replayed_keys(&mut self, keys: Vec<crate::KeyCombination>, depth: u16) {
+        if depth > Self::MAX_MACRO_NESTING {
+            return;
+        }
         let room = Self::MAX_REPLAYED_KEYS.saturating_sub(self.pending_input.len());
         self.pending_input.extend(
             keys.into_iter()
                 .take(room)
-                .map(|key| Event::Key(KeyEvent::new(key.key_code, key.modifier))),
+                .map(|key| (Event::Key(KeyEvent::new(key.key_code, key.modifier)), depth)),
         );
     }
 
@@ -1645,13 +1672,15 @@ impl Reedline {
         // buffer sitting at the head of the input stream.
         if !self.pending_input.is_empty() {
             let mut replayed = std::mem::take(&mut self.pending_input);
-            replayed.extend(events);
-            events = replayed.into_iter().collect();
+            replayed.extend(events.into_iter().map(|event| (event, 0u16)));
+            let (merged, depths): (Vec<Event>, VecDeque<u16>) = replayed.into_iter().unzip();
+            events = merged;
+            self.event_replay_depths = depths;
         }
         // Convert `Event` into `ReedlineEvent`. Also, fuse consecutive
         // `ReedlineEvent::EditCommand` into one. Also, if there're multiple
         // `ReedlineEvent::Resize`, only keep the last one.
-        let mut reedline_events: Vec<ReedlineEvent> = vec![];
+        let mut reedline_events: Vec<(ReedlineEvent, u16)> = vec![];
         // A detected paste burst is handled as ONE unit, bypassing the per-event
         // parse below. Routing each pasted char through `parse_event` is fragile:
         // any event that maps to a non-`Edit` reedline event (a `/` slash-menu
@@ -1685,6 +1714,7 @@ impl Reedline {
             // window: the drain loop has already stopped and `settle` has
             // already run by the time it is read, so it starts the *next*
             // batch instead, where it is handled as an ordinary submit.
+            self.event_replay_depths.clear();
             for event in &events {
                 if let Some(c) = burst_char(event) {
                     coalesced.push(c);
@@ -1716,11 +1746,15 @@ impl Reedline {
                     .clone()
                     .and_then(|h| h.resolve_burst(&coalesced))
                     .unwrap_or(coalesced);
-                reedline_events.push(ReedlineEvent::Edit(vec![EditCommand::InsertString(insert)]));
+                reedline_events.push((
+                    ReedlineEvent::Edit(vec![EditCommand::InsertString(insert)]),
+                    0,
+                ));
             }
         } else {
             let mut edits = vec![];
             for event in events {
+                self.replay_depth = self.event_replay_depths.pop_front().unwrap_or(0);
                 // Reclassify a newline key (bare `Enter`, or `Ctrl-J` for a raw
                 // LF) that the oracle judges paste-embedded into a newline even
                 // when a full burst was NOT detected (a short fast paste, e.g.
@@ -1751,8 +1785,10 @@ impl Reedline {
                         ReedlineEvent::Resize(x, y) => resize = Some((x, y)),
                         event => {
                             if !edits.is_empty() {
-                                reedline_events
-                                    .push(ReedlineEvent::Edit(std::mem::take(&mut edits)));
+                                reedline_events.push((
+                                    ReedlineEvent::Edit(std::mem::take(&mut edits)),
+                                    self.replay_depth,
+                                ));
                             }
                             // Quoted-insert is fully applied at parse
                             // time: fast typists deliver the trigger and
@@ -1762,19 +1798,25 @@ impl Reedline {
                             // the batch already spent.
                             if matches!(event, ReedlineEvent::QuotedInsert) {
                                 self.quoted_insert = true;
+                            } else if let ReedlineEvent::KeySequence(keys) = event {
+                                // Applied at parse time where the source's
+                                // nesting depth is known; a replayed macro
+                                // nests one level deeper (GNU macro.c
+                                // MAX_MACRO_LEVEL).
+                                self.enqueue_replayed_keys(keys, self.replay_depth + 1);
                             } else {
-                                reedline_events.push(event);
+                                reedline_events.push((event, self.replay_depth));
                             }
                         }
                     }
                 }
             }
             if !edits.is_empty() {
-                reedline_events.push(ReedlineEvent::Edit(edits));
+                reedline_events.push((ReedlineEvent::Edit(edits), self.replay_depth));
             }
         }
         if let Some((x, y)) = resize {
-            reedline_events.push(ReedlineEvent::Resize(x, y));
+            reedline_events.push((ReedlineEvent::Resize(x, y), 0));
         }
         // The synthetic `Submit` of `immediately_accept` mode is pushed after
         // both arms: nothing is read in that mode, so `events` is empty and the
@@ -1782,7 +1824,7 @@ impl Reedline {
         // `is_burst_active()` before anything was fed to it must still not
         // keep `read_line` spinning without a submit.
         if self.immediately_accept {
-            reedline_events.push(ReedlineEvent::Submit);
+            reedline_events.push((ReedlineEvent::Submit, 0));
         }
 
         // The mode machine has parsed this batch, so the rest policy it
@@ -1795,7 +1837,8 @@ impl Reedline {
 
         // Handle reedline events.
         let mut need_repaint = false;
-        for event in reedline_events {
+        for (event, depth) in reedline_events {
+            self.replay_depth = depth;
             match self.handle_event(prompt, event)? {
                 EventStatus::Exits(signal) => {
                     // Check if we are merely suspended (to process an ExecuteHostCommand event)
@@ -1844,7 +1887,7 @@ impl Reedline {
         // head of the next input batch and resolves through whatever keymap
         // is live then — the same in every input mode.
         if let ReedlineEvent::KeySequence(keys) = event {
-            self.enqueue_replayed_keys(keys);
+            self.enqueue_replayed_keys(keys, self.replay_depth + 1);
             return Ok(EventStatus::Handled);
         }
         if self.input_mode == InputMode::HistorySearch {
@@ -2128,7 +2171,7 @@ impl Reedline {
                 // Nested inside `Multiple`: queues for the next input
                 // batch — the Multiple's remaining events still run
                 // first (documented on the variant).
-                self.enqueue_replayed_keys(keys);
+                self.enqueue_replayed_keys(keys, self.replay_depth + 1);
                 Ok(EventStatus::Handled)
             }
             ReedlineEvent::QuotedInsert => {
@@ -4819,18 +4862,18 @@ mod tests {
     #[test]
     fn key_sequence_queue_is_capped() {
         let mut rl = seam_engine(Box::<crate::Emacs>::default());
-        rl.enqueue_replayed_keys(vec![
-            kc(KeyModifiers::NONE, KeyCode::Char('a'));
-            Reedline::MAX_REPLAYED_KEYS + 10
-        ]);
+        rl.enqueue_replayed_keys(
+            vec![kc(KeyModifiers::NONE, KeyCode::Char('a')); Reedline::MAX_REPLAYED_KEYS + 10],
+            1,
+        );
         assert_eq!(rl.pending_input.len(), Reedline::MAX_REPLAYED_KEYS);
         rl.pending_input.clear();
         // Re-enqueueing on a near-full queue only takes the room left.
-        rl.enqueue_replayed_keys(vec![
-            kc(KeyModifiers::NONE, KeyCode::Char('b'));
-            Reedline::MAX_REPLAYED_KEYS - 1
-        ]);
-        rl.enqueue_replayed_keys(vec![kc(KeyModifiers::NONE, KeyCode::Char('c')); 10]);
+        rl.enqueue_replayed_keys(
+            vec![kc(KeyModifiers::NONE, KeyCode::Char('b')); Reedline::MAX_REPLAYED_KEYS - 1],
+            1,
+        );
+        rl.enqueue_replayed_keys(vec![kc(KeyModifiers::NONE, KeyCode::Char('c')); 10], 1);
         assert_eq!(rl.pending_input.len(), Reedline::MAX_REPLAYED_KEYS);
     }
 
