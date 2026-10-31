@@ -1277,6 +1277,17 @@ pub enum ReedlineEvent {
     /// The queue is bounded ([`crate::Reedline::MAX_REPLAYED_KEYS`]); a
     /// self-retriggering sequence is truncated once the cap is reached.
     KeySequence(Vec<crate::edit_mode::KeyCombination>),
+
+    /// Inserts the next key literally, bypassing its binding
+    /// (readline `quoted-insert`, `C-v`/`C-q`).
+    ///
+    /// The key after this event is consumed as data, not dispatched:
+    /// a character inserts itself (control-modified characters insert
+    /// their control byte), `Enter` inserts `\r`, `Tab` inserts `\t`,
+    /// and non-character keys are consumed with no insert — matching
+    /// GNU's `rl_quoted_insert`, which reads one input character
+    /// verbatim.
+    QuotedInsert,
 }
 
 pub enum EventStatus {

@@ -259,6 +259,11 @@ pub struct Reedline {
     // onto the input stream). Bounded by [`Self::MAX_REPLAYED_KEYS`].
     pending_input: VecDeque<Event>,
 
+    // `ReedlineEvent::QuotedInsert` armed: the next key press is consumed
+    // as literal data instead of dispatching through the keymap (GNU
+    // readline.c rl_quoted_insert — one input character verbatim).
+    quoted_insert: bool,
+
     // External break signal: when set to `true`, `read_line()` will return
     // `Signal::ExternalBreak` with the current buffer contents.
     break_signal: Option<Arc<AtomicBool>>,
@@ -474,6 +479,38 @@ fn burst_char(event: &Event) -> Option<char> {
     }
 }
 
+/// The literal character a key press contributes under quoted-insert
+/// (GNU `rl_quoted_insert` — one input character verbatim): a `Char`
+/// inserts itself (control-modified forms insert their control byte),
+/// `Enter` is `\r`, `Tab` is `\t`, `Backspace` is DEL, `Esc` is ESC.
+/// Every other key is consumed with no insert — GNU reads exactly one
+/// input character and stops.
+fn quoted_insert_char(event: &Event) -> Option<char> {
+    if let Event::Key(KeyEvent {
+        code,
+        modifiers,
+        kind,
+        ..
+    }) = event
+    {
+        if *kind == KeyEventKind::Release {
+            return None;
+        }
+        return match code {
+            KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) => {
+                char::from_u32((*c as u32) & 0x1f)
+            }
+            KeyCode::Char(c) => Some(*c),
+            KeyCode::Enter => Some('\r'),
+            KeyCode::Tab => Some('\t'),
+            KeyCode::Backspace => Some('\u{7f}'),
+            KeyCode::Esc => Some('\u{1b}'),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// A key press that stands for a newline in pasted text: a bare `Enter` (CR),
 /// or `Ctrl-J`, which is how a raw LF arrives in raw mode.
 fn is_pasted_newline(event: &Event) -> bool {
@@ -554,6 +591,7 @@ impl Reedline {
             kitty_protocol: KittyProtocolGuard::default(),
             immediately_accept: false,
             pending_input: VecDeque::new(),
+            quoted_insert: false,
             break_signal: None,
             repaint_signal: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
@@ -1697,6 +1735,16 @@ impl Reedline {
                         continue;
                     }
                 }
+                // Quoted-insert bypasses the keymap: the armed flag turns
+                // the next key press into its literal character (GNU
+                // rl_quoted_insert). Anything else is consumed and gone.
+                if self.quoted_insert {
+                    self.quoted_insert = false;
+                    if let Some(c) = quoted_insert_char(&event) {
+                        edits.push(EditCommand::InsertChar(c));
+                    }
+                    continue;
+                }
                 if let Ok(event) = ReedlineRawEvent::try_from(event) {
                     match self.edit_mode.parse_event(event) {
                         ReedlineEvent::Edit(edit) => edits.extend(edit),
@@ -1706,7 +1754,17 @@ impl Reedline {
                                 reedline_events
                                     .push(ReedlineEvent::Edit(std::mem::take(&mut edits)));
                             }
-                            reedline_events.push(event);
+                            // Quoted-insert is fully applied at parse
+                            // time: fast typists deliver the trigger and
+                            // the next key in one batch, and the next
+                            // event is consumed right below. Pushing the
+                            // event would let its handler re-arm a flag
+                            // the batch already spent.
+                            if matches!(event, ReedlineEvent::QuotedInsert) {
+                                self.quoted_insert = true;
+                            } else {
+                                reedline_events.push(event);
+                            }
                         }
                     }
                 }
@@ -1906,6 +1964,7 @@ impl Reedline {
             | ReedlineEvent::ToStart
             | ReedlineEvent::ToEnd
             | ReedlineEvent::KeySequence(_)
+            | ReedlineEvent::QuotedInsert
             | ReedlineEvent::Multiple(_)
             | ReedlineEvent::None
             | ReedlineEvent::HistoryHintWordComplete
@@ -2070,6 +2129,10 @@ impl Reedline {
                 // batch — the Multiple's remaining events still run
                 // first (documented on the variant).
                 self.enqueue_replayed_keys(keys);
+                Ok(EventStatus::Handled)
+            }
+            ReedlineEvent::QuotedInsert => {
+                self.quoted_insert = true;
                 Ok(EventStatus::Handled)
             }
             ReedlineEvent::HistoryHintComplete => Ok(self.accept_history_hint(true)),
@@ -4769,6 +4832,34 @@ mod tests {
         ]);
         rl.enqueue_replayed_keys(vec![kc(KeyModifiers::NONE, KeyCode::Char('c')); 10]);
         assert_eq!(rl.pending_input.len(), Reedline::MAX_REPLAYED_KEYS);
+    }
+
+    /// C-v quoted-insert: the next key is literal data, not a binding —
+    /// including control keys that would otherwise act.
+    #[test]
+    fn quoted_insert_takes_next_key_literally() {
+        let mut rl = seam_engine(Box::<crate::Emacs>::default());
+        // C-v C-b inserts the control byte instead of moving left.
+        drive(
+            &mut rl,
+            &[
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            ],
+        );
+        assert_eq!(rl.editor.get_buffer(), "\u{2}");
+        assert_eq!(rl.current_insertion_point(), 1);
+        // Only one key is consumed; the next C-a acts normally.
+        drive(
+            &mut rl,
+            &[
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                ch('z'),
+            ],
+        );
+        assert_eq!(rl.editor.get_buffer(), "z\u{2}x");
     }
 
     #[test]
