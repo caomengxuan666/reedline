@@ -284,6 +284,19 @@ pub enum MotionTarget {
         /// Land on the character vs just before it.
         stop: FindStop,
     },
+    /// The bracket matching the one under the cursor — vi `%`, GNU
+    /// `rl_vi_match` (vi_mode.c:1951). When the cursor is not on a
+    /// bracket, GNU scans forward for the first bracket on the line
+    /// and matches that instead; no bracket at all is a no-op. The
+    /// pairs are `()`, `[]`, `{}` (GNU's `rl_vi_bracktype`,
+    /// vi_mode.c:1926 — `<>` is not a vi pair).
+    MatchingBracket,
+    /// The `n`th grapheme of the buffer, 1-based — vi `|`, GNU
+    /// `rl_vi_column` (vi_mode.c:1053), which moves `count - 1`
+    /// characters from buffer start. Past the buffer end it lands on
+    /// the last grapheme (GNU `rl_end_of_line`); `0` degenerates to
+    /// the buffer start.
+    Column(usize),
     /// A byte position, clamped into the buffer — measured from the buffer
     /// start, not a displacement from the cursor.
     Position(usize),
@@ -324,6 +337,8 @@ impl MotionTarget {
             // cursor, so callers resolve first and compare after.
             MotionTarget::Position(_) => None,
             MotionTarget::LineStartNonBlank => None,
+            MotionTarget::MatchingBracket => None,
+            MotionTarget::Column(_) => None,
         }
     }
 }
@@ -870,6 +885,33 @@ pub enum EditCommand {
     /// Swap the positions of the cursor and anchor
     SwapCursorAndAnchor,
 
+    /// Drop the mark at the insertion point — GNU `set-mark`
+    /// (`C-@`/`M-SPC`, text.c:1880 `_rl_set_mark_at_pos`, bound at
+    /// emacs_keymap.c:35 and :353). The mark is a saved buffer
+    /// position, not a selection: it is invisible by default, matching
+    /// GNU with `rl_enable_active_region` unset, and it does not move
+    /// with the cursor, so the region it defines grows as point moves.
+    SetMark,
+
+    /// Swap the insertion point with the mark — GNU
+    /// `exchange-point-and-mark` (`C-x C-x`, text.c:1885
+    /// `rl_exchange_point_and_mark`, bound at emacs_keymap.c:622).
+    /// Inapplicable when no mark is set — GNU's `rl_mark < 0` ding.
+    ExchangePointAndMark,
+
+    /// Kill the text between the mark and the insertion point into the
+    /// kill ring — GNU `kill-region` (kill.c:449 `rl_kill_region` →
+    /// `region_kill_internal`). The cursor lands on the region's start,
+    /// as GNU's `npoint` assignment does. Unbound in GNU's emacs map
+    /// too; exposed for custom bindings.
+    KillRegion,
+
+    /// Copy the text between the mark and the insertion point into the
+    /// kill ring without deleting it — GNU `copy-region-as-kill`
+    /// (kill.c:442 `rl_copy_region_to_kill`). Cursor does not move.
+    /// Unbound in GNU's emacs map too; exposed for custom bindings.
+    CopyRegionAsKill,
+
     /// Cut selection to system clipboard
     #[cfg(feature = "system_clipboard")]
     CutSelectionSystem,
@@ -941,6 +983,7 @@ impl EditCommand {
             | EditCommand::MoveLeftBefore { select, .. } => {
                 EditType::MoveCursor { select: *select }
             }
+            EditCommand::ExchangePointAndMark => EditType::MoveCursor { select: false },
             EditCommand::SwapCursorAndAnchor => EditType::MoveCursor { select: true },
 
             EditCommand::SelectAll => EditType::MoveCursor { select: true },
@@ -1003,7 +1046,8 @@ impl EditCommand {
             | EditCommand::SwitchcaseSelection
             | EditCommand::Paste
             | EditCommand::CutTextObject { .. }
-            | EditCommand::PasteAtSelectionEdge { .. } => EditType::EditText,
+            | EditCommand::PasteAtSelectionEdge { .. }
+            | EditCommand::KillRegion => EditType::EditText,
 
             #[cfg(feature = "system_clipboard")] // Sadly cfg attributes in patterns don't work
             EditCommand::CutSelectionSystem | EditCommand::PasteSystem => EditType::EditText,
@@ -1033,7 +1077,9 @@ impl EditCommand {
             | EditCommand::CopyRightBefore(_)
             | EditCommand::CopyLeftUntil(_)
             | EditCommand::CopyLeftBefore(_)
-            | EditCommand::CopyTextObject { .. } => EditType::NoOp,
+            | EditCommand::CopyTextObject { .. }
+            | EditCommand::SetMark
+            | EditCommand::CopyRegionAsKill => EditType::NoOp,
 
             EditCommand::AddTextObject { .. }
             | EditCommand::RemoveTextObject { .. }
@@ -1097,7 +1143,9 @@ impl EditCommand {
             | EditCommand::CutSelection { .. }
             | EditCommand::CutTextObject { .. }
             | EditCommand::CutFilenameLeft
+            | EditCommand::KillRegion
             | EditCommand::Copy { .. }
+            | EditCommand::CopyRegionAsKill
             | EditCommand::CopySelection
             | EditCommand::CopyFromStart
             | EditCommand::CopyFromStartLinewise
@@ -1574,12 +1622,76 @@ pub enum ReedlineEvent {
     /// explicit-arg form in GNU (`arg>0` overwrites, `arg<=0` inserts).
     OverwriteMode(Option<bool>),
 
+
     /// Suspend the editor like GNU `rl_suspend`/`rl_stop` (signals.c):
     /// the terminal is deprepped, `SIGTSTP` is raised to the own
     /// process, and on resume (`SIGCONT`) the terminal is re-prepped
     /// and the line repainted — all inside `read_line`, transparent to
     /// the host. No-op on platforms without job control signals.
     Suspend,
+
+    /// Collect a search string in-place, then run a single history
+    /// search on `Enter` — GNU `noninc-search-forward` /
+    /// `noninc-search-backward` (search.c:462 `noninc_search`, bound
+    /// `M-n`/`M-p` in the emacs map at emacs_keymap.c:441/:443 and
+    /// `/`/`?` in the vi map via `rl_vi_search`, vi_mode.c:365).
+    ///
+    /// While collecting, the line buffer holds the string being typed
+    /// (GNU reads it into `rl_line_buffer` after saving the real line,
+    /// search.c:244-247): edits apply to it normally, `Backspace` on an
+    /// empty buffer aborts (the `rl_point == 0` rubout branch,
+    /// search.c:331), and `C-g`/`C-c`/`Esc` abort and restore the
+    /// saved line. `Enter` commits: a string starting with `^` requires
+    /// a prefix match (`ANCHORED_SEARCH`, search.c:145-149), otherwise
+    /// any substring matches. An empty string reuses the last search
+    /// string from its last hit (`rl_point == 0`, search.c:412-425);
+    /// with none saved, the commit dings. A successful search leaves
+    /// the found entry in the buffer with the point at its start
+    /// (`rl_point = 0`, search.c:215); a failed one restores the saved
+    /// line and point.
+    ///
+    /// `prompt_char` is the one-character prompt GNU substitutes while
+    /// reading (`_rl_make_prompt_for_search`, search.c:235 — `:`
+    /// default, `/`/`?` in vi). `pattern` requests GNU's vi-command
+    /// glob matching (`SF_PATTERN` → `_hs_history_patsearch`,
+    /// histsearch.c:245): `*`, `?` and `[...]` classes, implicitly
+    /// wrapped in `*` when unanchored.
+    ///
+    /// Caveat vs GNU: `_rl_search_case_fold` is not modeled — matching
+    /// is always case-sensitive.
+    NonIncrementalSearch {
+        /// `Forward` searches newer entries (GNU `M-n`/vi `?`),
+        /// `Backward` older ones (`M-p`/vi `/`)
+        direction: Direction,
+        /// The prompt glyph shown while the string collects
+        prompt_char: char,
+        /// `true` for GNU's vi `SF_PATTERN` glob matching
+        pattern: bool,
+    },
+
+    /// Repeat the last non-incremental search with the saved string —
+    /// GNU `noninc-forward-search-again` /
+    /// `noninc-reverse-search-again` (search.c:517/:541), which vi's
+    /// `n`/`N` call through `rl_vi_search_again` (vi_mode.c:348).
+    /// Inapplicable — GNU dings — before the first search.
+    ///
+    /// `Forward` searches newer entries, `Backward` older ones, and
+    /// matching is always the `SF_PATTERN` glob form GNU uses under vi
+    /// command mode (vi_mode.c:355/:548).
+    NonIncrementalSearchAgain {
+        /// `Forward` toward newer entries (vi `N`), `Backward` toward
+        /// older ones (vi `n`)
+        direction: Direction,
+    },
+
+    /// Print the last recorded keyboard macro as a keyseq spelling —
+    /// GNU `print-last-kbd-macro` (macro.c:309
+    /// `rl_print_last_kbd_macro` → `_rl_untranslate_macro_value`,
+    /// bind.c:722). The spelling uses the GNU bind forms
+    /// (`\C-x`, `\M-x`, `\e`, `^?`) that `bind -p` emits; inapplicable
+    /// — GNU dings — when nothing is recorded. Unbound in GNU's maps
+    /// too; exposed for custom bindings.
+    PrintLastKbdMacro,
 }
 
 pub enum EventStatus {

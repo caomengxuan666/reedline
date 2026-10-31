@@ -69,9 +69,53 @@ where
             let _ = input.next();
             Some(Command::SubstituteCharWithInsert)
         }
-        Some('?') => {
+        // GNU `rl_vi_search` (vi_mode.c:365): `?` searches forward
+        // (newer entries), `/` backward (older) — both non-incremental
+        // under `SF_PATTERN`, not isearch.
+        Some('?') if mode == ViMode::Normal => {
             let _ = input.next();
-            Some(Command::HistorySearch)
+            Some(Command::ViSearch {
+                direction: Direction::Forward,
+                prompt_char: '?',
+            })
+        }
+        Some('/') if mode == ViMode::Normal => {
+            let _ = input.next();
+            Some(Command::ViSearch {
+                direction: Direction::Backward,
+                prompt_char: '/',
+            })
+        }
+        // GNU `rl_vi_search_again` (vi_mode.c:348): `n` resumes the
+        // saved search backward, `N` forward.
+        Some('n') if mode == ViMode::Normal => {
+            let _ = input.next();
+            Some(Command::SearchAgain {
+                direction: Direction::Backward,
+            })
+        }
+        Some('N') if mode == ViMode::Normal => {
+            let _ = input.next();
+            Some(Command::SearchAgain {
+                direction: Direction::Forward,
+            })
+        }
+        // GNU `U` — `rl_revert_line` (vi_keymap.c:129).
+        Some('U') if mode == ViMode::Normal => {
+            let _ = input.next();
+            Some(Command::RevertLine)
+        }
+        // GNU `rl_vi_yank_arg` (vi_mode.c:326, `_`): the count-th arg
+        // of the previous history line, or its last arg without one.
+        Some('_') if mode == ViMode::Normal => {
+            let _ = input.next();
+            Some(Command::YankArg)
+        }
+        // GNU `#` in the vi map — `rl_insert_comment`
+        // (vi_keymap.c:73): comment the line out and submit it.
+        Some('#') if mode == ViMode::Normal => {
+            let _ = input.next();
+            Some(Command::InsertComment)
         }
         Some('C') => {
             let _ = input.next();
@@ -171,15 +215,35 @@ pub(super) enum Command {
     PrependToStart,
     RewriteCurrentLine,
     Change,
-    HistorySearch,
+    /// vi `/`/`?` — GNU `rl_vi_search`, a non-incremental glob search.
+    ViSearch {
+        direction: Direction,
+        prompt_char: char,
+    },
+    /// vi `n`/`N` — GNU `rl_vi_search_again`.
+    SearchAgain {
+        direction: Direction,
+    },
+    /// vi `U` — GNU `rl_revert_line` (vi_keymap.c:129).
+    RevertLine,
+    /// vi `_` — GNU `rl_vi_yank_arg` (vi_mode.c:326).
+    YankArg,
+    /// vi `#` — GNU `rl_insert_comment` (vi_keymap.c:73).
+    InsertComment,
     Lowercase,
     Uppercase,
     Switchcase,
     RepeatLastAction,
     Yank,
-    ChangeTextObject { text_object: TextObject },
-    YankTextObject { text_object: TextObject },
-    DeleteTextObject { text_object: TextObject },
+    ChangeTextObject {
+        text_object: TextObject,
+    },
+    YankTextObject {
+        text_object: TextObject,
+    },
+    DeleteTextObject {
+        text_object: TextObject,
+    },
     SwapCursorAndAnchor,
 }
 
@@ -252,7 +316,36 @@ impl Command {
                     vec![ReedlineOption::Edit(EditCommand::CutChar)]
                 }
             }
-            Self::HistorySearch => vec![ReedlineOption::Event(ReedlineEvent::SearchHistory)],
+            Self::ViSearch {
+                direction,
+                prompt_char,
+            } => vec![ReedlineOption::Event(ReedlineEvent::NonIncrementalSearch {
+                direction: *direction,
+                prompt_char: *prompt_char,
+                // GNU sets `SF_PATTERN` for `?`/`/` read from vi command
+                // mode (search.c:236-238).
+                pattern: true,
+            })],
+            Self::SearchAgain { direction } => {
+                vec![ReedlineOption::Event(
+                    ReedlineEvent::NonIncrementalSearchAgain {
+                        direction: *direction,
+                    },
+                )]
+            }
+            Self::RevertLine => vec![ReedlineOption::Edit(EditCommand::RevertLine)],
+            // The arg form needs the multiplier, which `to_reedline`
+            // never sees; the parser's `to_reedline_event` lowers `_`.
+            // Bare `_` yanks the last argument (`rl_yank_nth_arg '$'`,
+            // vi_mode.c:334).
+            Self::YankArg => vec![ReedlineOption::Event(ReedlineEvent::YankLastArg {
+                count: None,
+            })],
+            Self::InsertComment => vec![
+                ReedlineOption::Edit(EditCommand::MoveToLineStart { select: false }),
+                ReedlineOption::Edit(EditCommand::InsertString("# ".to_string())),
+                ReedlineOption::Event(ReedlineEvent::Submit),
+            ],
             Self::Lowercase => {
                 vec![ReedlineOption::Edit(EditCommand::LowercaseSelection)]
             }
@@ -318,7 +411,9 @@ impl Command {
                 | Motion::PreviousWord
                 | Motion::PreviousBigWord
                 | Motion::Start
-                | Motion::End => motion.target().map(|target| {
+                | Motion::End
+                | Motion::MatchBrackets
+                | Motion::Column => motion.target().map(|target| {
                     vec![ReedlineOption::Edit(EditCommand::Cut {
                         target,
                         granularity: Granularity::CharWise,
@@ -382,7 +477,9 @@ impl Command {
                     | Motion::PreviousWord
                     | Motion::PreviousBigWord
                     | Motion::Start
-                    | Motion::End => {
+                    | Motion::End
+                    | Motion::MatchBrackets
+                    | Motion::Column => {
                         let target = match motion {
                             Motion::NextWord => Motion::NextWordEnd.target(),
                             Motion::NextBigWord => Motion::NextBigWordEnd.target(),
@@ -454,7 +551,9 @@ impl Command {
                 | Motion::PreviousWord
                 | Motion::PreviousBigWord
                 | Motion::Start
-                | Motion::End => motion.target().map(|target| {
+                | Motion::End
+                | Motion::MatchBrackets
+                | Motion::Column => motion.target().map(|target| {
                     vec![ReedlineOption::Edit(EditCommand::Copy {
                         target,
                         granularity: Granularity::CharWise,

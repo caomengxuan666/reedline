@@ -175,6 +175,49 @@ pub fn default_emacs_keybindings() -> Keybindings {
     }
     kb.add_binding(KM::ALT, KC::Char('-'), ReedlineEvent::DigitArgument(None));
 
+    // GNU non-incremental history search (search.c:462 `noninc_search`):
+    // `M-n`/`M-p` collect a string in-place, then `Enter` runs one
+    // forward/backward search (emacs_keymap.c:441/:443).
+    kb.add_binding(
+        KM::ALT,
+        KC::Char('n'),
+        ReedlineEvent::NonIncrementalSearch {
+            direction: Direction::Forward,
+            prompt_char: ':',
+            pattern: false,
+        },
+    );
+    kb.add_binding(
+        KM::ALT,
+        KC::Char('p'),
+        ReedlineEvent::NonIncrementalSearch {
+            direction: Direction::Backward,
+            prompt_char: ':',
+            pattern: false,
+        },
+    );
+
+    // GNU `set-mark` (text.c:1880): `C-@` and `M-SPC` drop the mark at
+    // point (emacs_keymap.c:35, :353). Terminals report `C-@` as
+    // Ctrl-Space or Ctrl-@; both spellings bind.
+    kb.add_binding(KM::CONTROL, KC::Char(' '), edit_bind(EC::SetMark));
+    kb.add_binding(KM::CONTROL, KC::Char('@'), edit_bind(EC::SetMark));
+    kb.add_binding(KM::ALT, KC::Char(' '), edit_bind(EC::SetMark));
+
+    // GNU `insert-comment` (text.c:1384 `rl_insert_comment`): `M-#`
+    // comments out the line and submits it (emacs_keymap.c:356 —
+    // `RL_COMMENT_BEGIN_DEFAULT` is `"# "`). The un-commenting explicit
+    // argument form is not modeled.
+    kb.add_binding(
+        KM::ALT,
+        KC::Char('#'),
+        ReedlineEvent::Multiple(vec![
+            edit_bind(EC::MoveToLineStart { select: false }),
+            edit_bind(EC::InsertString("# ".to_string())),
+            ReedlineEvent::Submit,
+        ]),
+    );
+
     kb
 }
 
@@ -312,6 +355,11 @@ impl Emacs {
             }
             (KeyModifiers::NONE, KeyCode::Char('e')) => ReedlineEvent::CallLastKbdMacro,
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => edit_bind(EditCommand::Undo),
+            // `C-x C-x` — GNU `exchange-point-and-mark`
+            // (emacs_keymap.c:622).
+            (KeyModifiers::CONTROL, KeyCode::Char('x')) => {
+                edit_bind(EditCommand::ExchangePointAndMark)
+            }
             _ => ReedlineEvent::None,
         }
     }

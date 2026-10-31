@@ -12,7 +12,7 @@ pub use helix::{
     default_helix_insert_keybindings, default_helix_normal_keybindings,
     default_helix_select_keybindings, Helix,
 };
-pub use keybindings::{KeyCombination, Keybindings};
+pub use keybindings::{key_sequence_spelling, KeyCombination, Keybindings};
 pub use vi::{
     default_vi_insert_keybindings, default_vi_normal_keybindings, default_vi_visual_keybindings, Vi,
 };

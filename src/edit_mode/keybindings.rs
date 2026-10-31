@@ -11,6 +11,73 @@ pub struct KeyCombination {
     pub key_code: KeyCode,
 }
 
+impl KeyCombination {
+    /// The GNU bind spelling of this keypress —
+    /// `_rl_untranslate_macro_value` (bind.c:722) applied to a recorded
+    /// keystroke rather than a byte: `\C-x` for control chords,
+    /// `\M-x` for alt, `\e` for escape, `^?` for backspace, and the
+    /// terminal byte sequences GNU would have literally captured for
+    /// named keys (Up is `\e[A`, Delete `\e[3~`). `^M`/`^I`/`^?`
+    /// cover the control bytes in `^`-form, the other half of the
+    /// convention niubash's `parse_key_sequence` reads.
+    pub fn spelling(&self) -> String {
+        fn char_spelling(c: char, modifiers: KeyModifiers) -> String {
+            if modifiers.contains(KeyModifiers::CONTROL) {
+                // `_rl_untranslate_macro_value`'s CTRL_CHAR arm.
+                return match c {
+                    ' ' | '@' => "\\C-@".to_string(),
+                    '[' => "\\e".to_string(),
+                    '?' => "\\C-?".to_string(),
+                    _ => format!("\\C-{}", c.to_ascii_lowercase()),
+                };
+            }
+            match c {
+                '\\' => "\\\\".to_string(),
+                '"' => "\\\"".to_string(),
+                c if modifiers.contains(KeyModifiers::SHIFT) => c.to_ascii_uppercase().to_string(),
+                c => c.to_string(),
+            }
+        }
+
+        if self.modifier.contains(KeyModifiers::ALT) {
+            if let KeyCode::Char(c) = self.key_code {
+                // META_CHAR → `\M-` then the unmeta'd spelling.
+                return format!(
+                    "\\M-{}",
+                    char_spelling(c, self.modifier - KeyModifiers::ALT)
+                );
+            }
+        }
+        match self.key_code {
+            KeyCode::Char(c) => char_spelling(c, self.modifier),
+            KeyCode::Enter => "^M".to_string(),
+            KeyCode::Tab => "^I".to_string(),
+            KeyCode::BackTab => "\\e[Z".to_string(),
+            KeyCode::Backspace => "^?".to_string(),
+            KeyCode::Delete => "\\e[3~".to_string(),
+            KeyCode::Insert => "\\e[2~".to_string(),
+            KeyCode::Home => "\\e[H".to_string(),
+            KeyCode::End => "\\e[F".to_string(),
+            KeyCode::PageUp => "\\e[5~".to_string(),
+            KeyCode::PageDown => "\\e[6~".to_string(),
+            KeyCode::Up => "\\e[A".to_string(),
+            KeyCode::Down => "\\e[B".to_string(),
+            KeyCode::Right => "\\e[C".to_string(),
+            KeyCode::Left => "\\e[D".to_string(),
+            KeyCode::Esc => "\\e".to_string(),
+            KeyCode::F(n) => format!("F{n}"),
+            other => format!("{other:?}"),
+        }
+    }
+}
+
+/// Concatenate the [`KeyCombination::spelling`]s of a recorded key
+/// sequence — the `print-last-kbd-macro` dump
+/// (`rl_print_last_kbd_macro`, macro.c:309).
+pub fn key_sequence_spelling(keys: &[KeyCombination]) -> String {
+    keys.iter().map(KeyCombination::spelling).collect()
+}
+
 /// Main definition of editor keybindings
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Keybindings {

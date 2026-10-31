@@ -1,6 +1,6 @@
 use super::command::{parse_command, Command};
 use super::motion::{parse_motion, Motion};
-use crate::{edit_mode::vi::ViMode, EditCommand, ReedlineEvent, Vi};
+use crate::{edit_mode::vi::ViMode, EditCommand, MotionTarget, ReedlineEvent, Vi};
 use std::iter::Peekable;
 
 #[derive(Debug, Clone)]
@@ -106,7 +106,6 @@ impl ParsedViSequence {
             | (Some(Command::PrependToStart), ParseResult::Incomplete)
             | (Some(Command::RewriteCurrentLine), ParseResult::Incomplete)
             | (Some(Command::SubstituteCharWithInsert), ParseResult::Incomplete)
-            | (Some(Command::HistorySearch), ParseResult::Incomplete)
             | (Some(Command::Change), ParseResult::Valid(_)) => Some(ViMode::Insert),
             (Some(Command::Change), ParseResult::Incomplete) if mode == ViMode::Visual => {
                 Some(ViMode::Insert)
@@ -151,6 +150,18 @@ impl ParsedViSequence {
     }
 
     pub fn to_reedline_event(&self, vi_state: &mut Vi) -> ReedlineEvent {
+        // GNU `rl_vi_yank_arg` (vi_mode.c:326): `_` yanks the last
+        // argument of the previous history entry — with an explicit
+        // count it calls `rl_yank_nth_arg(count - 1)` instead. Kept out
+        // of `Command::to_reedline`, which cannot see the count.
+        if self.command == Some(Command::YankArg) && self.motion == ParseResult::Incomplete {
+            return match self.count.or(self.multiplier) {
+                Some(n) => ReedlineEvent::YankNthArg {
+                    count: n.saturating_sub(1) as i32,
+                },
+                None => ReedlineEvent::YankLastArg { count: None },
+            };
+        }
         match (&self.multiplier, &self.command, &self.count, &self.motion) {
             (_, Some(command), None, ParseResult::Incomplete) => {
                 let events = self.apply_multiplier(Some(command.to_reedline(vi_state)));
@@ -163,6 +174,18 @@ impl ParsedViSequence {
                     self.apply_multiplier(command.to_reedline_with_motion(motion, vi_state));
                 Self::record_previous(vi_state, command, &events);
                 events
+            }
+            (_, None, _, ParseResult::Valid(Motion::Column)) => {
+                // `rl_vi_column` (vi_mode.c:1053): the multiplier IS the
+                // target column — `5|` lands on the fifth character, it
+                // does not run the motion five times.
+                let target = MotionTarget::Column(self.total_multiplier());
+                let edit = if vi_state.mode == ViMode::Visual {
+                    EditCommand::Extend(target)
+                } else {
+                    EditCommand::Move(target)
+                };
+                ReedlineEvent::Edit(vec![edit])
             }
             (_, None, _, ParseResult::Valid(motion)) => {
                 self.apply_multiplier(Some(motion.to_reedline(vi_state)))
